@@ -1,4 +1,4 @@
-{ lib, craneLib }:
+{ lib, craneLib, cacert }:
 let
   root = ../.;
 
@@ -38,6 +38,7 @@ craneLib.buildPackage (commonArgs // {
     tests = craneLib.cargoNextest (commonArgs // {
       inherit cargoArtifacts;
       cargoNextestExtraArgs = "--no-fail-fast";
+      SSL_CERT_FILE = "${cacert}/etc/ssl/certs/ca-bundle.crt";
     });
   };
 
