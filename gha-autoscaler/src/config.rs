@@ -36,6 +36,10 @@ pub struct Connection {
     pub max_launches_per_kind: u32,
     #[serde(default)]
     pub worker_flake: Option<String>,
+    #[serde(default)]
+    pub worker_substituters: Vec<String>,
+    #[serde(default)]
+    pub worker_trusted_public_keys: Vec<String>,
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout: u64,
     #[serde(default = "default_max_lifetime")]
@@ -63,7 +67,7 @@ fn default_idle_timeout() -> u64 {
 }
 
 fn default_max_lifetime() -> u64 {
-    21600
+    18000
 }
 
 impl Config {

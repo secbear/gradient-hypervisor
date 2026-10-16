@@ -210,23 +210,57 @@ impl State {
         rows.iter().map(Launch::from_row).collect()
     }
 
-    pub async fn set_launch_state(&self, id: Uuid, state: LaunchState) -> anyhow::Result<()> {
-        sqlx::query("UPDATE launch SET state = ?, updated_at = ? WHERE id = ?")
-            .bind(state.as_str())
+    pub async fn advance_launch(&self, id: Uuid, to: LaunchState) -> anyhow::Result<bool> {
+        let earlier: Vec<LaunchState> = OPEN_STATES.into_iter().filter(|s| *s < to).collect();
+        self.move_launch(id, to, &earlier, "").await
+    }
+
+    pub async fn close_launch(&self, id: Uuid, to: LaunchState) -> anyhow::Result<bool> {
+        self.move_launch(id, to, &OPEN_STATES, "").await
+    }
+
+    pub async fn claim_cancel(&self, id: Uuid) -> anyhow::Result<bool> {
+        let waiting = [LaunchState::Dispatched, LaunchState::Queued];
+        self.move_launch(id, LaunchState::Cancelled, &waiting, " AND swapped = 0")
+            .await
+    }
+
+    async fn move_launch(
+        &self,
+        id: Uuid,
+        to: LaunchState,
+        from: &[LaunchState],
+        condition: &str,
+    ) -> anyhow::Result<bool> {
+        if from.is_empty() {
+            return Ok(false);
+        }
+        let placeholders = vec!["?"; from.len()].join(", ");
+        let sql = format!(
+            "UPDATE launch SET state = ?, updated_at = ? WHERE id = ? AND state IN ({placeholders}){condition}"
+        );
+        let mut query = sqlx::query(&sql)
+            .bind(to.as_str())
             .bind(now())
-            .bind(id.to_string())
-            .execute(&self.0)
-            .await?;
-        Ok(())
+            .bind(id.to_string());
+        for state in from {
+            query = query.bind(state.as_str());
+        }
+        Ok(query.execute(&self.0).await?.rows_affected() == 1)
     }
 
     pub async fn mark_swapped(&self, id: Uuid, worker_id: Uuid) -> anyhow::Result<bool> {
         let result = sqlx::query(
-            "UPDATE launch SET swapped = 1, worker_id = ?, updated_at = ? WHERE id = ? AND swapped = 0",
+            "UPDATE launch SET swapped = 1, worker_id = ?, updated_at = ?
+             WHERE id = ? AND swapped = 0 AND state IN (?, ?, ?, ?)",
         )
         .bind(worker_id.to_string())
         .bind(now())
         .bind(id.to_string())
+        .bind(OPEN_STATES[0].as_str())
+        .bind(OPEN_STATES[1].as_str())
+        .bind(OPEN_STATES[2].as_str())
+        .bind(OPEN_STATES[3].as_str())
         .execute(&self.0)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -335,6 +369,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_and_swap_exclude_each_other() {
+        let state = State::memory().await.unwrap();
+        let swapped = Launch::new("a", 1, "ubuntu-latest");
+        let cancelled = Launch::new("a", 2, "ubuntu-latest");
+        state.insert_launch(&swapped).await.unwrap();
+        state.insert_launch(&cancelled).await.unwrap();
+
+        assert!(
+            state
+                .mark_swapped(swapped.id, Uuid::new_v4())
+                .await
+                .unwrap()
+        );
+        assert!(!state.claim_cancel(swapped.id).await.unwrap());
+
+        assert!(state.claim_cancel(cancelled.id).await.unwrap());
+        assert!(
+            !state
+                .mark_swapped(cancelled.id, Uuid::new_v4())
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_state_never_moves_backwards_or_reopens() {
+        let state = State::memory().await.unwrap();
+        let launch = Launch::new("a", 1, "ubuntu-latest");
+        state.insert_launch(&launch).await.unwrap();
+        let current = |state: &State| {
+            let state = state.clone();
+            async move { state.launch("a", launch.id).await.unwrap().unwrap().state }
+        };
+
+        assert!(
+            state
+                .advance_launch(launch.id, LaunchState::Connected)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !state
+                .advance_launch(launch.id, LaunchState::Running)
+                .await
+                .unwrap()
+        );
+        assert_eq!(current(&state).await, LaunchState::Connected);
+
+        assert!(
+            state
+                .close_launch(launch.id, LaunchState::Completed)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !state
+                .advance_launch(launch.id, LaunchState::Connected)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !state
+                .close_launch(launch.id, LaunchState::Failed)
+                .await
+                .unwrap()
+        );
+        assert_eq!(current(&state).await, LaunchState::Completed);
+    }
+
+    #[tokio::test]
     async fn launches_are_per_connection() {
         let state = State::memory().await.unwrap();
         let own = Launch::new("team-a", 1, "ubuntu-latest");
@@ -353,10 +457,12 @@ mod tests {
         let state = State::memory().await.unwrap();
         let launch = Launch::new("a", 1, "ubuntu-latest");
         state.insert_launch(&launch).await.unwrap();
-        state
-            .set_launch_state(launch.id, LaunchState::Failed)
-            .await
-            .unwrap();
+        assert!(
+            state
+                .close_launch(launch.id, LaunchState::Failed)
+                .await
+                .unwrap()
+        );
 
         assert!(state.open_launches("a").await.unwrap().is_empty());
         let hour_ago = OffsetDateTime::now_utc() - Duration::hours(1);

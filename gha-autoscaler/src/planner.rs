@@ -193,7 +193,7 @@ impl<'a> Planner<'a> {
 
     fn cancel_unneeded(&mut self) {
         for (launch, used) in self.open.iter().zip(&self.used) {
-            if !used && launch.state.is_waiting_for_runner() {
+            if !used && !launch.swapped && launch.state.is_waiting_for_runner() {
                 self.plan.cancel.push(launch.run_id);
             }
         }
@@ -221,6 +221,8 @@ mod tests {
             max_launches: 4,
             max_launches_per_kind: 2,
             worker_flake: None,
+            worker_substituters: Vec::new(),
+            worker_trusted_public_keys: Vec::new(),
             idle_timeout: 120,
             max_lifetime: 21600,
         }
@@ -365,6 +367,22 @@ mod tests {
     }
 
     #[test]
+    fn swapped_queued_launch_is_not_cancelled() {
+        let launches = [Launch {
+            swapped: true,
+            ..open("ubuntu-latest", 1, LaunchState::Queued)
+        }];
+        let plan = plan(
+            &TeamDemand::default(),
+            &launches,
+            &standard_kinds(),
+            &connection(),
+            &no_backoff(),
+        );
+        assert!(plan.cancel.is_empty());
+    }
+
+    #[test]
     fn uncovered_requirement_reported() {
         let demand = builds(&[("aarch64-darwin", &[]), ("x86_64-linux", &["cuda"])]);
         let plan = plan(
@@ -413,7 +431,7 @@ mod tests {
             let launch = Launch::new("ops", run_id, "ubuntu-latest");
             state.insert_launch(&launch).await.unwrap();
             state
-                .set_launch_state(launch.id, LaunchState::Failed)
+                .close_launch(launch.id, LaunchState::Failed)
                 .await
                 .unwrap();
         }

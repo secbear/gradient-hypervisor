@@ -70,6 +70,7 @@ async fn scale_dispatches_and_records_the_launch() {
     assert_eq!(body["ref"], "trunk");
     assert_eq!(body["inputs"]["launch_id"], launch.id.to_string());
     assert_eq!(body["inputs"]["runs_on"], r#"["ubuntu-latest"]"#);
+    assert_eq!(body["inputs"]["substituters"], "https://cache.example.com");
     assert_eq!(
         body["inputs"]["autoscaler_url"],
         "https://scaler.example.com"

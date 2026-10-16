@@ -2,7 +2,7 @@ use crate::github::DispatchInputs;
 use crate::kinds::Kind;
 use crate::planner::{backed_off_labels, plan};
 use crate::service::ConnectionService;
-use crate::state::{Launch, LaunchState};
+use crate::state::Launch;
 use crate::workflow::WORKFLOW_FILE;
 use uuid::Uuid;
 
@@ -43,16 +43,17 @@ pub async fn scale(svc: &ConnectionService) -> anyhow::Result<()> {
 }
 
 async fn cancel(svc: &ConnectionService, launch: &Launch) {
+    match svc.state.claim_cancel(launch.id).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            tracing::error!(connection = %svc.conn.name, "recording cancelled run: {error:#}");
+            return;
+        }
+    }
     match svc.github.cancel_run(launch.run_id).await {
         Ok(()) => {
-            tracing::info!(connection = %svc.conn.name, run_id = launch.run_id, "cancelled unneeded run");
-            if let Err(error) = svc
-                .state
-                .set_launch_state(launch.id, LaunchState::Cancelled)
-                .await
-            {
-                tracing::error!(connection = %svc.conn.name, "recording cancelled run: {error:#}");
-            }
+            tracing::info!(connection = %svc.conn.name, run_id = launch.run_id, "cancelled unneeded run")
         }
         Err(error) => {
             tracing::warn!(connection = %svc.conn.name, run_id = launch.run_id, "cancelling run: {error:#}")
@@ -83,6 +84,8 @@ async fn dispatch(
         worker_flake: worker_flake.to_owned(),
         idle_timeout: svc.conn.idle_timeout,
         max_lifetime: svc.conn.max_lifetime,
+        substituters: svc.conn.worker_substituters.join(" "),
+        trusted_public_keys: svc.conn.worker_trusted_public_keys.join(" "),
     };
     let run_id = svc.github.dispatch(WORKFLOW_FILE, branch, &inputs).await?;
     let launch = Launch {

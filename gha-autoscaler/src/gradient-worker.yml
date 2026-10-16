@@ -26,6 +26,14 @@ on:
       max_lifetime:
         type: string
         required: true
+      substituters:
+        type: string
+        required: false
+        default: ""
+      trusted_public_keys:
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -37,6 +45,10 @@ jobs:
     timeout-minutes: 360
     steps:
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+        with:
+          extra_nix_config: |
+            extra-substituters = ${{ inputs.substituters }}
+            extra-trusted-public-keys = ${{ inputs.trusted_public_keys }}
       - name: Run Gradient worker
         env:
           AUTOSCALER_URL: ${{ inputs.autoscaler_url }}

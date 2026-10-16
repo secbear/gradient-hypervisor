@@ -232,12 +232,52 @@ async fn catch_up_closes_launch_missed_by_webhook() {
     let never_connected = Launch::new("ops", 31, "ubuntu-latest");
     let finished = Launch::new("ops", 32, "ubuntu-latest");
     let still_queued = Launch::new("ops", 33, "ubuntu-latest");
-    for launch in [&never_connected, &finished, &still_queued] {
+    let swapped_but_offline = Launch::new("ops", 34, "ubuntu-latest");
+    for launch in [
+        &never_connected,
+        &finished,
+        &still_queued,
+        &swapped_but_offline,
+    ] {
         svc.state.insert_launch(launch).await.unwrap();
     }
     let worker = Uuid::new_v4();
+    let offline_worker = Uuid::new_v4();
     svc.state.mark_swapped(finished.id, worker).await.unwrap();
-    for (run_id, status) in [(31, "completed"), (32, "completed"), (33, "queued")] {
+    svc.state
+        .mark_swapped(swapped_but_offline.id, offline_worker)
+        .await
+        .unwrap();
+    let team_workers = json!([
+        { "worker_id": worker, "display_name": "gha-32-1", "connected": true, "live": {
+            "architectures": ["x86_64-linux"], "system_features": ["kvm"],
+            "max_concurrent_builds": 4, "ram_total_mb": 16000
+        } },
+        { "worker_id": offline_worker, "display_name": "gha-34-1", "connected": false, "live": null }
+    ]);
+    mount(
+        &server,
+        "GET",
+        "/api/v1/teams/ops/workers",
+        envelope(team_workers),
+        None,
+    )
+    .await;
+    let offline_delete = format!("/api/v1/teams/ops/workers/{offline_worker}");
+    mount(
+        &server,
+        "DELETE",
+        &offline_delete,
+        envelope(json!("deleted")),
+        Some(1),
+    )
+    .await;
+    for (run_id, status) in [
+        (31, "completed"),
+        (32, "completed"),
+        (33, "queued"),
+        (34, "completed"),
+    ] {
         let run = ok(json!({ "id": run_id, "status": status, "conclusion": null }));
         mount(
             &server,
@@ -275,36 +315,12 @@ async fn catch_up_closes_launch_missed_by_webhook() {
     assert_eq!(state(never_connected.id).await, LaunchState::Failed);
     assert_eq!(state(finished.id).await, LaunchState::Completed);
     assert_eq!(state(still_queued.id).await, LaunchState::Cancelled);
-}
-
-#[tokio::test]
-async fn catch_up_ignores_unrecorded_team_workers() {
-    let server = MockServer::start().await;
-    let human_worker = json!([{
-        "worker_id": Uuid::new_v4(), "display_name": "gha-1-1", "connected": false, "live": null
-    }]);
-    mount(
-        &server,
-        "GET",
-        "/api/v1/teams/ops/workers",
-        envelope(human_worker),
-        None,
-    )
-    .await;
-    mount(
-        &server,
-        "GET",
-        "/api/v1/teams/ops/workers/demand",
-        envelope(json!({ "builds": [], "fetch": 0, "eval": 0 })),
-        None,
-    )
-    .await;
-    Mock::given(method("DELETE"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(0)
-        .mount(&server)
-        .await;
-    let svc = service(&server).await;
-
-    catch_up(&svc).await;
+    assert_eq!(state(swapped_but_offline.id).await, LaunchState::Failed);
+    let learned = svc
+        .state
+        .profile("ops", "ubuntu-latest")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(learned.features, ["kvm"]);
 }

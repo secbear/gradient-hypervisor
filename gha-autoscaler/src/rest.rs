@@ -1,7 +1,10 @@
 use anyhow::Context;
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
+use std::time::Duration;
 
 const BODY_EXCERPT_BYTES: usize = 512;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, thiserror::Error)]
 #[error("{method} {path} answered {status}: {body}")]
@@ -10,6 +13,14 @@ pub struct ApiError {
     pub path: String,
     pub status: StatusCode,
     pub body: String,
+}
+
+pub(crate) fn http_client() -> Client {
+    Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()
+        .expect("TLS backend initializes")
 }
 
 pub(crate) async fn send(client: &Client, request: RequestBuilder) -> anyhow::Result<Response> {

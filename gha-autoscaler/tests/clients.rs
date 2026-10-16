@@ -30,7 +30,9 @@ fn inputs() -> DispatchInputs {
         launch_id: Uuid::nil(),
         worker_flake: "github:wavelens/gradient/v2.0.0#gradient".into(),
         idle_timeout: 120,
-        max_lifetime: 21600,
+        max_lifetime: 18000,
+        substituters: String::new(),
+        trusted_public_keys: String::new(),
     }
 }
 

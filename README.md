@@ -64,4 +64,4 @@ On every start and every `catchUpInterval` seconds, the service creates or repai
 
 ### Worker Version
 
-The run starts `gradient-worker` from `github:wavelens/gradient/v<server version>#gradient`, using the version the Gradient server reports. `workerFlake` overrides it.
+The run starts `gradient-worker` from `github:wavelens/gradient/v<server version>#gradient`, using the version the Gradient server reports. `workerFlake` overrides it. Without a binary cache holding that closure, every run builds Gradient from source, so point `workerSubstituters` and `workerTrustedPublicKeys` at one.

@@ -58,7 +58,7 @@ impl OidcVerifier {
 
     pub fn new(issuer: &str) -> OidcVerifier {
         OidcVerifier {
-            http: Client::new(),
+            http: crate::rest::http_client(),
             issuer: issuer.trim_end_matches('/').to_owned(),
             keys: Mutex::new(KeyCache::default()),
         }

@@ -159,10 +159,7 @@ async fn token_swap(
     {
         Ok(response) => {
             let learner = svc.clone();
-            let worker_id = response.worker_id;
-            tokio::spawn(
-                async move { learn_profile(&learner, request.launch_id, worker_id).await },
-            );
+            tokio::spawn(async move { learn_profile(&learner, request.launch_id).await });
             Json(response).into_response()
         }
         Err(SwapError::Failed(error)) => {

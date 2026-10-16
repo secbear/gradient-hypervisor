@@ -89,7 +89,7 @@ struct RotatedSecret {
 impl GradientClient {
     pub fn new(base: Url, api_key: String) -> GradientClient {
         GradientClient {
-            http: Client::new(),
+            http: crate::rest::http_client(),
             base,
             api_key,
         }

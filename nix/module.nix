@@ -95,6 +95,23 @@ let
         '';
       };
 
+      workerSubstituters = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "https://gradient.example.com/cache/main" ];
+        description = ''
+          Binary caches the runner adds to its Nix configuration before fetching {option}`services.gradient-gha-autoscaler.connections.<name>.workerFlake`.
+          A cache holding the worker closure keeps the run from building Gradient from source.
+        '';
+      };
+
+      workerTrustedPublicKeys = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "gradient.example.com-1:AAAA..." ];
+        description = "Public keys that sign the paths in {option}`services.gradient-gha-autoscaler.connections.<name>.workerSubstituters`.";
+      };
+
       idleTimeout = mkOption {
         type = types.ints.positive;
         default = 120;
@@ -103,10 +120,10 @@ let
 
       maxLifetime = mkOption {
         type = types.ints.positive;
-        default = 21600;
+        default = 18000;
         description = ''
           Seconds after which a worker drains, finishes its running jobs and ends its run.
-          GitHub stops a job after 6 hours, so larger values have no effect.
+          GitHub stops a job after 6 hours, so keep room for installing Nix and fetching the worker.
         '';
       };
     };
@@ -119,7 +136,7 @@ let
       inherit name;
       inherit (connection)
         gradientUrl team repository allowedKinds projects maxLaunches maxLaunchesPerKind
-        workerFlake idleTimeout maxLifetime;
+        workerFlake workerSubstituters workerTrustedPublicKeys idleTimeout maxLifetime;
       apiKeyFile = "${credentialsDir}/${name}-api-key";
       githubTokenFile = "${credentialsDir}/${name}-github-token";
     }) cfg.connections;

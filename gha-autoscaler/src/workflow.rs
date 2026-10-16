@@ -33,6 +33,7 @@ pub fn decide(existing: Option<&str>, version: &str) -> WorkflowAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::DispatchInputs;
 
     #[test]
     fn decide_keeps_user_owned_file_without_marker() {
@@ -58,7 +59,7 @@ mod tests {
     }
 
     #[test]
-    fn render_contains_no_secret_inputs() {
+    fn render_inputs_match_dispatch_and_hold_no_secrets() {
         let rendered = render("0.1.0");
         assert!(rendered.starts_with(&format!("{MARKER}0.1.0\n")));
         let inputs = rendered
@@ -66,23 +67,34 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("\npermissions:").next())
             .unwrap();
-        let names: Vec<&str> = inputs
+        let mut names: Vec<&str> = inputs
             .lines()
             .filter(|line| line.starts_with("      ") && !line.starts_with("        "))
             .map(|line| line.trim().trim_end_matches(':'))
             .collect();
-        assert_eq!(
-            names,
-            [
-                "runs_on",
-                "autoscaler_url",
-                "connection",
-                "launch_id",
-                "worker_flake",
-                "idle_timeout",
-                "max_lifetime"
-            ]
-        );
+        names.sort_unstable();
+
+        let dispatched = DispatchInputs {
+            runs_on: String::new(),
+            autoscaler_url: String::new(),
+            connection: String::new(),
+            launch_id: uuid::Uuid::nil(),
+            worker_flake: String::new(),
+            idle_timeout: 0,
+            max_lifetime: 0,
+            substituters: String::new(),
+            trusted_public_keys: String::new(),
+        }
+        .as_json();
+        let mut sent: Vec<&str> = dispatched
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        sent.sort_unstable();
+
+        assert_eq!(names, sent);
         assert!(
             !names
                 .iter()

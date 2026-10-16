@@ -1,4 +1,4 @@
-use crate::events::{advance, finish_launch};
+use crate::events::{advance, finish_launch, record_connected_workers};
 use crate::rest::status_of;
 use crate::scaler::scale;
 use crate::service::ConnectionService;
@@ -39,6 +39,9 @@ pub async fn catch_up(svc: &ConnectionService) {
 }
 
 async fn reconcile(svc: &ConnectionService) -> anyhow::Result<()> {
+    if let Err(error) = record_connected_workers(svc).await {
+        tracing::warn!(connection = %svc.conn.name, "reading team workers: {error:#}");
+    }
     for launch in svc.state.open_launches(&svc.conn.name).await? {
         let status = match svc.github.run(launch.run_id).await {
             Ok(run) => run.status,

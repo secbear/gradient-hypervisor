@@ -181,6 +181,12 @@ async fn run_completed_deletes_recorded_worker_only() {
     fixture
         .svc
         .state
+        .advance_launch(finished.id, LaunchState::Connected)
+        .await
+        .unwrap();
+    fixture
+        .svc
+        .state
         .mark_swapped(still_running.id, Uuid::new_v4())
         .await
         .unwrap();

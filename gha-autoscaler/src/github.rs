@@ -27,6 +27,8 @@ pub struct DispatchInputs {
     pub worker_flake: String,
     pub idle_timeout: u64,
     pub max_lifetime: u64,
+    pub substituters: String,
+    pub trusted_public_keys: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -117,7 +119,7 @@ struct SelfHostedRunners {
 }
 
 impl DispatchInputs {
-    fn as_json(&self) -> serde_json::Value {
+    pub(crate) fn as_json(&self) -> serde_json::Value {
         json!({
             "runs_on": self.runs_on,
             "autoscaler_url": self.autoscaler_url,
@@ -126,6 +128,8 @@ impl DispatchInputs {
             "worker_flake": self.worker_flake,
             "idle_timeout": self.idle_timeout.to_string(),
             "max_lifetime": self.max_lifetime.to_string(),
+            "substituters": self.substituters,
+            "trusted_public_keys": self.trusted_public_keys,
         })
     }
 }
@@ -138,7 +142,7 @@ impl GitHubClient {
 
     pub fn with_api_url(api: Url, token: String, repository: String) -> GitHubClient {
         GitHubClient {
-            http: Client::new(),
+            http: crate::rest::http_client(),
             api,
             token,
             repository,
