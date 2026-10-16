@@ -1,10 +1,14 @@
 pub mod config;
+pub mod events;
 pub mod github;
 pub mod gradient;
+pub mod http;
 pub mod kinds;
 pub mod oidc;
 pub mod planner;
 mod rest;
+pub mod scaler;
+pub mod service;
 pub mod state;
 pub mod swap;
 pub mod workflow;
