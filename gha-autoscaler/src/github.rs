@@ -174,7 +174,6 @@ impl GitHubClient {
         let request = self.request(Method::POST, &path).json(&json!({
             "ref": git_ref,
             "inputs": inputs.as_json(),
-            "return_run_details": true,
         }));
         let response = send(&self.http, request).await?;
         if response.status() != StatusCode::OK {
