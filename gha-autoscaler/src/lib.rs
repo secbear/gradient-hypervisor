@@ -1,3 +1,4 @@
+pub mod catch_up;
 pub mod config;
 pub mod events;
 pub mod github;
@@ -9,6 +10,7 @@ pub mod planner;
 mod rest;
 pub mod scaler;
 pub mod service;
+pub mod setup;
 pub mod state;
 pub mod swap;
 pub mod workflow;
