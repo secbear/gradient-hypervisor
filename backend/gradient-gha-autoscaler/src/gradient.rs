@@ -16,7 +16,8 @@ pub struct GradientClient {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct TeamDemand {
     pub builds: Vec<UnmetRequirement>,
-    pub fetch: u32,
+    pub network: u32,
+    pub secrets: u32,
     pub eval: u32,
 }
 
@@ -152,7 +153,8 @@ impl GradientClient {
             .json(&json!({
                 "worker_id": worker_id.to_string(),
                 "display_name": display_name,
-                "enable_fetch": true,
+                "enable_network": true,
+                "enable_secrets": true,
                 "enable_eval": true,
                 "enable_build": true,
             }));

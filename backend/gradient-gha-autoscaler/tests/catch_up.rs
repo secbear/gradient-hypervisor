@@ -224,7 +224,7 @@ async fn catch_up_closes_launch_missed_by_webhook() {
         &server,
         "GET",
         "/api/v1/teams/ops/workers/demand",
-        envelope(json!({ "builds": [], "fetch": 0, "eval": 0 })),
+        envelope(json!({ "builds": [], "network": 0, "secrets": 0, "eval": 0 })),
         None,
     )
     .await;

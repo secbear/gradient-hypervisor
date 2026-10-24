@@ -39,8 +39,8 @@ pub fn plan(
     for requirement in demand.builds.iter().filter(|r| r.build_count > 0) {
         planner.cover_build(&requirement.architecture, &requirement.required_features);
     }
-    if demand.fetch > 0 || demand.eval > 0 {
-        planner.cover_fetch_and_eval();
+    if demand.network > 0 || demand.secrets > 0 || demand.eval > 0 {
+        planner.cover_network_and_eval();
     }
     planner.cancel_unneeded();
     planner.plan
@@ -149,7 +149,7 @@ impl<'a> Planner<'a> {
         unknown.iter().any(|kind| self.try_launch(&kind.label, 1))
     }
 
-    fn cover_fetch_and_eval(&mut self) {
+    fn cover_network_and_eval(&mut self) {
         let runs_linux = |kind: Option<&Kind>| {
             kind.and_then(|k| k.profile.as_ref())
                 .is_some_and(|p| p.runs_linux())
@@ -238,7 +238,8 @@ mod tests {
                     build_count: 5,
                 })
                 .collect(),
-            fetch: 0,
+            network: 0,
+            secrets: 0,
             eval: 0,
         }
     }

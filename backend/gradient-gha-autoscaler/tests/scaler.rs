@@ -26,7 +26,7 @@ async fn demand(server: &MockServer, builds: Value) {
         .and(path("/api/v1/teams/ops/workers/demand"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "error": false,
-            "message": { "builds": builds, "fetch": 0, "eval": 0 }
+            "message": { "builds": builds, "network": 0, "secrets": 0, "eval": 0 }
         })))
         .mount(server)
         .await;

@@ -128,7 +128,8 @@ async fn team_demand_parses_builds_and_eval_gaps() {
             "error": false,
             "message": {
                 "builds": [{ "architecture": "aarch64-linux", "required_features": ["kvm"], "build_count": 3 }],
-                "fetch": 0,
+                "network": 0,
+                "secrets": 0,
                 "eval": 2
             }
         })))
@@ -149,7 +150,7 @@ async fn team_demand_parses_builds_and_eval_gaps() {
             build_count: 3,
         }]
     );
-    assert_eq!((demand.fetch, demand.eval), (0, 2));
+    assert_eq!((demand.network, demand.secrets, demand.eval), (0, 0, 2));
 }
 
 #[tokio::test]
@@ -160,14 +161,14 @@ async fn team_demand_without_allowlist_sends_no_projects_parameter() {
         .and(query_param_is_missing("projects"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "error": false,
-            "message": { "builds": [], "fetch": 1, "eval": 0 }
+            "message": { "builds": [], "network": 1, "secrets": 0, "eval": 0 }
         })))
         .expect(1)
         .mount(&server)
         .await;
 
     let demand = gradient(&server).team_demand("ops", None).await.unwrap();
-    assert_eq!(demand.fetch, 1);
+    assert_eq!(demand.network, 1);
 }
 
 #[tokio::test]
