@@ -11,7 +11,7 @@
     forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
   in {
     packages = forAllSystems (pkgs: rec {
-      gradient-gha-autoscaler = pkgs.callPackage ./nix/package.nix { craneLib = crane.mkLib pkgs; };
+      gradient-gha-autoscaler = pkgs.callPackage ./nix/packages/gradient-gha-autoscaler.nix { craneLib = crane.mkLib pkgs; };
       default = gradient-gha-autoscaler;
     });
 
@@ -19,8 +19,21 @@
       inherit (self.packages.${pkgs.stdenv.hostPlatform.system}.gradient-gha-autoscaler) tests clippy fmt;
     });
 
+    devShells = forAllSystems (pkgs: {
+      default = pkgs.mkShell {
+        packages = with pkgs; [
+          cargo
+          cargo-nextest
+          clippy
+          rustc
+          rustfmt
+          sqlite
+        ];
+      };
+    });
+
     nixosModules = rec {
-      gradient-gha-autoscaler = import ./nix/module.nix self;
+      gradient-gha-autoscaler = import ./nix/modules/gradient-gha-autoscaler.nix self;
       default = gradient-gha-autoscaler;
     };
   };

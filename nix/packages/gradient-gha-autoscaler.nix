@@ -1,15 +1,15 @@
 { lib, craneLib, cacert }:
 let
-  root = ../.;
+  root = ../../backend;
 
   src = lib.fileset.toSource {
     inherit root;
     fileset = lib.fileset.unions [
       (craneLib.fileset.commonCargoSources root)
-      ../rustfmt.toml
-      ../gha-autoscaler/migrations
-      ../gha-autoscaler/src/gradient-worker.yml
-      ../gha-autoscaler/tests/data
+      ../../backend/rustfmt.toml
+      ../../backend/gradient-gha-autoscaler/migrations
+      ../../backend/gradient-gha-autoscaler/src/gradient-worker.yml
+      ../../backend/gradient-gha-autoscaler/tests/data
     ];
   };
 
