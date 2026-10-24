@@ -1,0 +1,96 @@
+{{- $fullname := include "gradient-autoscaler.fullname" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "gradient-autoscaler.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "gradient-autoscaler.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gradient-autoscaler.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include "gradient-autoscaler.config" . | sha256sum }}
+    spec:
+      serviceAccountName: {{ $fullname }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: autoscaler
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+          readinessProbe:
+            tcpSocket:
+              port: http
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/gradient-autoscaler
+              readOnly: true
+            - name: secrets
+              mountPath: /run/secrets/gradient-autoscaler
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/gradient-autoscaler
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $fullname }}
+        - name: state
+          persistentVolumeClaim:
+            claimName: {{ $fullname }}
+        - name: secrets
+          projected:
+            defaultMode: 0440
+            sources:
+              {{- range $name, $connection := .Values.connections }}
+              - secret:
+                  name: {{ $connection.apiKeySecret.name }}
+                  items:
+                    - key: {{ $connection.apiKeySecret.key }}
+                      path: {{ $name }}/api-key
+              {{- with $connection.githubActions }}
+              - secret:
+                  name: {{ .tokenSecret.name }}
+                  items:
+                    - key: {{ .tokenSecret.key }}
+                      path: {{ $name }}/github-token
+              {{- end }}
+              {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

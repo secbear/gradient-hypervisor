@@ -1,0 +1,40 @@
+{{- $fullname := include "gradient-autoscaler.fullname" . -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "gradient-autoscaler.labels" . | nindent 4 }}
+{{- range $namespace := include "gradient-autoscaler.workerNamespaces" . | fromJsonArray }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gradient-autoscaler.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [create, get, list, delete]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "gradient-autoscaler.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $fullname }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}

@@ -1,0 +1,47 @@
+publicUrl: https://autoscaler.example.com
+
+connections:
+  platform:
+    gradientUrl: https://gradient.example.com
+    team: platform
+    apiKeySecret:
+      name: gradient-api-key
+      key: api-key
+    maxLaunches: 6
+    workerSubstituters:
+      - https://gradient.example.com/cache/main
+    workerTrustedPublicKeys:
+      - gradient.example.com-1:AAAA
+    kubernetes:
+      namespace: gradient-workers
+      image: registry.example.com/gradient-worker:2.0.1
+      pools:
+        x86:
+          system: x86_64-linux
+          features: [big-parallel, kvm]
+          maxJobs: 8
+          cpu: "8"
+          memory: 32Gi
+          privileged: true
+          nodeSelector:
+            kubernetes.io/arch: amd64
+        arm:
+          system: aarch64-linux
+          nodeSelector:
+            kubernetes.io/arch: arm64
+  actions:
+    gradientUrl: https://gradient.example.com
+    team: platform
+    apiKeySecret:
+      name: gradient-api-key
+      key: api-key
+    githubActions:
+      repository: acme/gradient-runners
+      tokenSecret:
+        name: github-token
+        key: token
+
+ingress:
+  enabled: true
+  className: nginx
+  host: autoscaler.example.com

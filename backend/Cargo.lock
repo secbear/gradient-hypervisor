@@ -695,7 +695,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gradient-gha-autoscaler"
+name = "gradient-autoscaler"
 version = "0.1.0"
 dependencies = [
  "anyhow",

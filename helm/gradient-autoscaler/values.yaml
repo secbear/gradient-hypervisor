@@ -1,0 +1,31 @@
+image:
+  repository: ghcr.io/wavelens/gradient-autoscaler
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+publicUrl: https://autoscaler.example.com
+catchUpInterval: 300
+
+connections: {}
+
+service:
+  type: ClusterIP
+  port: 8080
+
+ingress:
+  enabled: false
+  className: ""
+  host: autoscaler.example.com
+  annotations: {}
+  tls: []
+
+persistence:
+  size: 1Gi
+  storageClass: ""
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

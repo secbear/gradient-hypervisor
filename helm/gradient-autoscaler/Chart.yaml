@@ -1,0 +1,7 @@
+apiVersion: v2
+name: gradient-autoscaler
+description: Starts temporary Gradient team workers as Kubernetes pods or GitHub Actions runs
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/wavelens/gradient-hypervisor

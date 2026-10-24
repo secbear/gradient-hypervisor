@@ -1,0 +1,302 @@
+use anyhow::{Context, bail};
+use serde::Deserialize;
+use std::collections::{BTreeMap, HashSet};
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use url::Url;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Config {
+    pub listen: SocketAddr,
+    pub public_url: Url,
+    pub state_dir: PathBuf,
+    #[serde(default = "default_catch_up_interval")]
+    pub catch_up_interval: u64,
+    #[serde(default)]
+    pub connections: Vec<Connection>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "ConnectionFields")]
+pub struct Connection {
+    pub name: String,
+    pub gradient_url: Url,
+    pub team: String,
+    pub api_key_file: PathBuf,
+    pub projects: Option<Vec<String>>,
+    pub max_launches: u32,
+    pub max_launches_per_kind: u32,
+    pub worker_substituters: Vec<String>,
+    pub worker_trusted_public_keys: Vec<String>,
+    pub idle_timeout: u64,
+    pub max_lifetime: u64,
+    pub launcher: LauncherConfig,
+}
+
+#[derive(Debug, Clone)]
+pub enum LauncherConfig {
+    GitHubActions(GitHubActions),
+    Kubernetes(Kubernetes),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GitHubActions {
+    pub token_file: PathBuf,
+    pub repository: String,
+    #[serde(default = "default_allowed_kinds")]
+    pub allowed_kinds: Vec<String>,
+    #[serde(default)]
+    pub worker_flake: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Kubernetes {
+    #[serde(default)]
+    pub api_server: Option<Url>,
+    #[serde(default = "default_service_account_token")]
+    pub token_file: PathBuf,
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+    pub namespace: String,
+    pub image: String,
+    #[serde(default)]
+    pub image_pull_secrets: Vec<String>,
+    pub pools: BTreeMap<String, Pool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Pool {
+    pub system: String,
+    #[serde(default)]
+    pub features: Vec<String>,
+    #[serde(default = "default_pool_max_jobs")]
+    pub max_jobs: u32,
+    #[serde(default)]
+    pub cpu: Option<String>,
+    #[serde(default)]
+    pub memory: Option<String>,
+    #[serde(default)]
+    pub node_selector: BTreeMap<String, String>,
+    #[serde(default)]
+    pub tolerations: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub privileged: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConnectionFields {
+    name: String,
+    gradient_url: Url,
+    team: String,
+    api_key_file: PathBuf,
+    #[serde(default)]
+    projects: Option<Vec<String>>,
+    #[serde(default = "default_max_launches")]
+    max_launches: u32,
+    #[serde(default = "default_max_launches_per_kind")]
+    max_launches_per_kind: u32,
+    #[serde(default)]
+    worker_substituters: Vec<String>,
+    #[serde(default)]
+    worker_trusted_public_keys: Vec<String>,
+    #[serde(default = "default_idle_timeout")]
+    idle_timeout: u64,
+    #[serde(default = "default_max_lifetime")]
+    max_lifetime: u64,
+    #[serde(default)]
+    github_actions: Option<GitHubActions>,
+    #[serde(default)]
+    kubernetes: Option<Kubernetes>,
+}
+
+fn default_catch_up_interval() -> u64 {
+    300
+}
+
+fn default_allowed_kinds() -> Vec<String> {
+    vec!["ubuntu-latest".into(), "ubuntu-24.04-arm".into()]
+}
+
+fn default_max_launches() -> u32 {
+    4
+}
+
+fn default_max_launches_per_kind() -> u32 {
+    2
+}
+
+fn default_idle_timeout() -> u64 {
+    120
+}
+
+fn default_max_lifetime() -> u64 {
+    18000
+}
+
+fn default_pool_max_jobs() -> u32 {
+    4
+}
+
+fn default_service_account_token() -> PathBuf {
+    PathBuf::from("/var/run/secrets/kubernetes.io/serviceaccount/token")
+}
+
+impl Config {
+    pub fn load(path: &Path) -> anyhow::Result<Config> {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading config {}", path.display()))?;
+        Self::parse(&raw)
+    }
+
+    pub fn parse(raw: &str) -> anyhow::Result<Config> {
+        let config: Config = serde_json::from_str(raw).context("parsing config")?;
+        let mut names = HashSet::new();
+        for connection in &config.connections {
+            if !names.insert(connection.name.as_str()) {
+                bail!("connection name {:?} is used twice", connection.name);
+            }
+        }
+
+        Ok(config)
+    }
+}
+
+impl TryFrom<ConnectionFields> for Connection {
+    type Error = anyhow::Error;
+
+    fn try_from(fields: ConnectionFields) -> anyhow::Result<Connection> {
+        let name = fields.name;
+        if !is_lowercase_name(&name) {
+            bail!("connection name {name:?} may only hold a-z, 0-9 and -");
+        }
+
+        let launcher = match (fields.github_actions, fields.kubernetes) {
+            (Some(github), None) => LauncherConfig::GitHubActions(github.validated(&name)?),
+            (None, Some(kubernetes)) => LauncherConfig::Kubernetes(kubernetes.validated(&name)?),
+            _ => bail!("connection {name}: set exactly one of githubActions and kubernetes"),
+        };
+        Ok(Connection {
+            name,
+            gradient_url: fields.gradient_url,
+            team: fields.team,
+            api_key_file: fields.api_key_file,
+            projects: fields.projects,
+            max_launches: fields.max_launches,
+            max_launches_per_kind: fields.max_launches_per_kind,
+            worker_substituters: fields.worker_substituters,
+            worker_trusted_public_keys: fields.worker_trusted_public_keys,
+            idle_timeout: fields.idle_timeout,
+            max_lifetime: fields.max_lifetime,
+            launcher,
+        })
+    }
+}
+
+impl GitHubActions {
+    fn validated(self, connection: &str) -> anyhow::Result<GitHubActions> {
+        let parts = self.repository.split('/').filter(|part| !part.is_empty());
+        if parts.count() != 2 {
+            bail!(
+                "connection {connection}: repository {:?} is not owner/name",
+                self.repository
+            );
+        }
+
+        Ok(self)
+    }
+
+    pub fn owner(&self) -> &str {
+        self.repository.split('/').next().unwrap_or_default()
+    }
+}
+
+impl Kubernetes {
+    fn validated(self, connection: &str) -> anyhow::Result<Kubernetes> {
+        if self.pools.is_empty() {
+            bail!("connection {connection}: kubernetes needs at least one pool");
+        }
+
+        if let Some(label) = self.pools.keys().find(|label| !is_lowercase_name(label)) {
+            bail!("connection {connection}: pool name {label:?} may only hold a-z, 0-9 and -");
+        }
+
+        Ok(self)
+    }
+}
+
+fn is_lowercase_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GITHUB: &str = r#""githubActions":{"tokenFile":"/g","repository":"acme/runners"}"#;
+    const KUBERNETES: &str = r#""kubernetes":{"namespace":"ci","image":"worker:1","pools":{"x86":{"system":"x86_64-linux"}}}"#;
+
+    fn with_connections(connections: &str) -> String {
+        format!(
+            r#"{{"listen":"127.0.0.1:8080","publicUrl":"https://scaler.example.com","stateDir":"/tmp/x","connections":[{connections}]}}"#
+        )
+    }
+
+    fn connection(name: &str, launcher: &str) -> String {
+        format!(
+            r#"{{"name":"{name}","gradientUrl":"https://gradient.example.com","team":"ops","apiKeyFile":"/k",{launcher}}}"#
+        )
+    }
+
+    fn error_of(connections: &str) -> String {
+        format!(
+            "{:#}",
+            Config::parse(&with_connections(connections)).unwrap_err()
+        )
+    }
+
+    #[test]
+    fn config_rejects_duplicate_connection_names() {
+        let both = format!(
+            "{},{}",
+            connection("a", GITHUB),
+            connection("a", KUBERNETES)
+        );
+        assert!(error_of(&both).contains("used twice"));
+    }
+
+    #[test]
+    fn config_rejects_names_outside_the_url_safe_set() {
+        assert!(error_of(&connection("Team_A", GITHUB)).contains("may only hold"));
+    }
+
+    #[test]
+    fn config_rejects_repository_without_owner() {
+        let launcher = GITHUB.replace("acme/runners", "runners");
+        assert!(error_of(&connection("a", &launcher)).contains("owner/name"));
+    }
+
+    #[test]
+    fn config_needs_exactly_one_launcher() {
+        let both = format!("{GITHUB},{KUBERNETES}");
+        for launcher in [both.as_str(), r#""projects":null"#] {
+            assert!(error_of(&connection("a", launcher)).contains("exactly one"));
+        }
+    }
+
+    #[test]
+    fn kubernetes_needs_a_pool_with_a_lowercase_name() {
+        let pools = r#"{"x86":{"system":"x86_64-linux"}}"#;
+        let empty = KUBERNETES.replace(pools, "{}");
+        let uppercase = KUBERNETES.replace("\"x86\"", "\"X86\"");
+        assert!(error_of(&connection("a", &empty)).contains("at least one pool"));
+        assert!(error_of(&connection("a", &uppercase)).contains("pool name"));
+    }
+}
