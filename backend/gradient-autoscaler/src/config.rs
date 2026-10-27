@@ -225,6 +225,10 @@ impl Kubernetes {
             bail!("connection {connection}: pool name {label:?} may only hold a-z, 0-9 and -");
         }
 
+        if let Some((label, _)) = self.pools.iter().find(|(_, pool)| pool.max_jobs == 0) {
+            bail!("connection {connection}: pool {label}: maxJobs must be greater than zero");
+        }
+
         Ok(self)
     }
 }
@@ -298,5 +302,14 @@ mod tests {
         let uppercase = KUBERNETES.replace("\"x86\"", "\"X86\"");
         assert!(error_of(&connection("a", &empty)).contains("at least one pool"));
         assert!(error_of(&connection("a", &uppercase)).contains("pool name"));
+    }
+
+    #[test]
+    fn kubernetes_rejects_zero_build_slots() {
+        let zero = KUBERNETES.replace(
+            r#""system":"x86_64-linux""#,
+            r#""system":"x86_64-linux","maxJobs":0"#,
+        );
+        assert!(error_of(&connection("a", &zero)).contains("maxJobs must be greater than zero"));
     }
 }

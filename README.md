@@ -15,6 +15,7 @@ Starts temporary Gradient team workers when connected workers cannot handle wait
 ### Kubernetes
 
 - Each pool in `kubernetes.pools` is one kind of worker pod with its system, features, job slots, resources, node selector and tolerations.
+- `maxJobs` sets the worker's concurrent build slots. A value of zero is rejected during configuration loading.
 - For each launch, the service registers a team worker and creates the pod `gradient-worker-<launch id>` with `restartPolicy: Never`. The worker token goes into a Secret of the same name that the pod owns, so deleting the pod deletes the token.
 - The service polls pod phases. A pod that exits, fails or cannot pull its image ends its launch, and the service deletes it.
 - The service needs `create`, `get`, `list` and `delete` on pods and `create` on secrets in the worker namespace.
