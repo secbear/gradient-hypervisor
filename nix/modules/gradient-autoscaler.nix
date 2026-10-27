@@ -244,6 +244,22 @@ let
         description = "Public keys that sign the paths in {option}`${option "workerSubstituters"}`.";
       };
 
+      workerCapabilities = mkOption {
+        default = { };
+        type = types.submodule {
+          options = lib.genAttrs [ "build" "network" "secrets" "eval" ] (role: mkOption {
+            type = types.bool;
+            default = true;
+            description = "Whether this connection grants workers the ${role} capability.";
+          });
+        };
+        description = ''
+          Capabilities granted at worker registration. All options default to true.
+          Kubernetes workers receive matching runtime settings. Demand for disabled roles is excluded
+          before planning launches.
+        '';
+      };
+
       idleTimeout = mkOption {
         type = types.ints.positive;
         default = 120;
@@ -293,7 +309,7 @@ let
       inherit name;
       inherit (connection)
         gradientUrl team projects maxLaunches maxLaunchesPerKind
-        workerSubstituters workerTrustedPublicKeys idleTimeout maxLifetime;
+        workerSubstituters workerTrustedPublicKeys workerCapabilities idleTimeout maxLifetime;
       apiKeyFile = "${credentialsDir}/${name}-api-key";
     } // launcherConfig name connection) cfg.connections;
   };

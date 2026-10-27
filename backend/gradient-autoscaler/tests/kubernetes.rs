@@ -3,6 +3,7 @@ mod common;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use gradient_autoscaler::catch_up::catch_up;
+use gradient_autoscaler::config::WorkerCapabilities;
 use gradient_autoscaler::github::oidc::OidcVerifier;
 use gradient_autoscaler::http::{App, router};
 use gradient_autoscaler::kubernetes::client::KubernetesClient;
@@ -105,7 +106,15 @@ async fn open_launch_since(
 #[tokio::test]
 async fn scale_starts_a_pod_whose_secret_holds_the_registered_token() {
     let server = MockServer::start().await;
-    let fixture = common::kubernetes_service(&server.uri()).await;
+    let mut fixture = common::kubernetes_service(&server.uri()).await;
+    Arc::get_mut(&mut fixture.svc)
+        .unwrap()
+        .conn
+        .worker_capabilities = WorkerCapabilities {
+        eval: false,
+        secrets: false,
+        ..Default::default()
+    };
     let svc = &fixture.svc;
     demand(
         &server,
@@ -151,6 +160,10 @@ async fn scale_starts_a_pod_whose_secret_holds_the_registered_token() {
     let registration = json_of(&received(&server, "POST", "/api/v1/teams/ops/workers").await[0]);
     let worker_id = registration["worker_id"].as_str().unwrap();
     assert_eq!(launch.worker_id.unwrap().to_string(), worker_id);
+    assert_eq!(registration["enable_build"], true);
+    assert_eq!(registration["enable_network"], true);
+    assert_eq!(registration["enable_eval"], false);
+    assert_eq!(registration["enable_secrets"], false);
 
     let manifest = json_of(&received(&server, "POST", PODS).await[0]);
     assert_eq!(manifest["metadata"]["name"], launch.external_id);
@@ -164,6 +177,16 @@ async fn scale_starts_a_pod_whose_secret_holds_the_registered_token() {
             .any(|var| var["name"] == "GRADIENT_WORKER_ID" && var["value"] == worker_id)
     );
     assert!(!manifest.to_string().contains("worker-token"));
+    for (role, enabled) in [
+        ("BUILD", "true"),
+        ("NETWORK", "true"),
+        ("EVAL", "false"),
+        ("SECRETS", "false"),
+    ] {
+        assert!(env.iter().any(|var| {
+            var["name"] == format!("GRADIENT_WORKER_CAPABILITIES_{role}") && var["value"] == enabled
+        }));
+    }
 
     let secret = json_of(&received(&server, "POST", SECRETS).await[0]);
     assert_eq!(

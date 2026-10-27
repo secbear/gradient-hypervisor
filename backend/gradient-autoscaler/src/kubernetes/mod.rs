@@ -138,10 +138,16 @@ impl KubernetesLauncher {
         );
         let registered = svc
             .gradient
-            .register_team_worker(&svc.conn.team, worker_id, &display_name)
+            .register_team_worker_with_capabilities(
+                &svc.conn.team,
+                worker_id,
+                &display_name,
+                svc.conn.worker_capabilities,
+            )
             .await?;
         let server_url = worker_server_url(&svc.conn.gradient_url)?;
         let manifest = WorkerPod {
+            capabilities: svc.conn.worker_capabilities,
             connection: &svc.conn.name,
             launch_id: launch.id,
             pool_name: &launch.label,
