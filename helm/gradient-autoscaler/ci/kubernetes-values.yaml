@@ -8,6 +8,9 @@ connections:
       name: gradient-api-key
       key: api-key
     maxLaunches: 6
+    workerCapabilities:
+      eval: false
+      secrets: false
     workerSubstituters:
       - https://gradient.example.com/cache/main
     workerTrustedPublicKeys:

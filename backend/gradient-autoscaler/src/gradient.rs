@@ -1,3 +1,4 @@
+use crate::config::WorkerCapabilities;
 use crate::rest::send;
 use reqwest::{Client, Method};
 use serde::Deserialize;
@@ -19,6 +20,24 @@ pub struct TeamDemand {
     pub network: u32,
     pub secrets: u32,
     pub eval: u32,
+}
+
+impl TeamDemand {
+    pub fn restricted_to(mut self, caps: WorkerCapabilities) -> Self {
+        if !caps.build {
+            self.builds.clear();
+        }
+        if !caps.network {
+            self.network = 0;
+        }
+        if !caps.network || !caps.secrets {
+            self.secrets = 0;
+        }
+        if !caps.eval {
+            self.eval = 0;
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -148,15 +167,31 @@ impl GradientClient {
         worker_id: Uuid,
         display_name: &str,
     ) -> anyhow::Result<RegisteredWorker> {
+        self.register_team_worker_with_capabilities(
+            team,
+            worker_id,
+            display_name,
+            WorkerCapabilities::default(),
+        )
+        .await
+    }
+
+    pub async fn register_team_worker_with_capabilities(
+        &self,
+        team: &str,
+        worker_id: Uuid,
+        display_name: &str,
+        capabilities: WorkerCapabilities,
+    ) -> anyhow::Result<RegisteredWorker> {
         let request = self
             .request(Method::POST, &format!("/api/v1/teams/{team}/workers"))
             .json(&json!({
                 "worker_id": worker_id.to_string(),
                 "display_name": display_name,
-                "enable_network": true,
-                "enable_secrets": true,
-                "enable_eval": true,
-                "enable_build": true,
+                "enable_network": capabilities.network,
+                "enable_secrets": capabilities.secrets,
+                "enable_eval": capabilities.eval,
+                "enable_build": capabilities.build,
             }));
         let registered: RegisteredTeamWorker = self.message(request).await?;
         let token = registered.token.ok_or_else(|| {
@@ -231,6 +266,56 @@ mod tests {
         assert_eq!(
             worker_server_url(&http).unwrap(),
             "ws://10.0.0.2:3000/proto"
+        );
+    }
+
+    #[test]
+    fn demand_excludes_roles_this_connection_cannot_supply() {
+        let demand = TeamDemand {
+            network: 1,
+            secrets: 2,
+            eval: 3,
+            builds: vec![UnmetRequirement {
+                architecture: "x86_64-linux".into(),
+                required_features: vec![],
+                build_count: 4,
+            }],
+        };
+        assert_eq!(
+            demand.clone().restricted_to(WorkerCapabilities::default()),
+            demand
+        );
+        let build_only = demand.clone().restricted_to(WorkerCapabilities {
+            secrets: false,
+            eval: false,
+            ..Default::default()
+        });
+        assert_eq!(build_only.builds, demand.builds);
+        assert_eq!(
+            (build_only.network, build_only.secrets, build_only.eval),
+            (1, 0, 0)
+        );
+        let without_network = demand.clone().restricted_to(WorkerCapabilities {
+            network: false,
+            ..Default::default()
+        });
+        assert_eq!(without_network.builds, demand.builds);
+        assert_eq!(
+            (
+                without_network.network,
+                without_network.secrets,
+                without_network.eval
+            ),
+            (0, 0, 3)
+        );
+        assert_eq!(
+            demand.restricted_to(WorkerCapabilities {
+                build: false,
+                network: false,
+                secrets: false,
+                eval: false,
+            }),
+            TeamDemand::default()
         );
     }
 }

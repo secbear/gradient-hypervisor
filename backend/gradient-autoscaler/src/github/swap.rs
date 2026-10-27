@@ -57,7 +57,12 @@ pub async fn swap(
 
     let display_name = format!("gha-{}-{}", claims.run_id, claims.run_attempt);
     let registered = gradient
-        .register_team_worker(&conn.team, worker_id, &display_name)
+        .register_team_worker_with_capabilities(
+            &conn.team,
+            worker_id,
+            &display_name,
+            conn.worker_capabilities,
+        )
         .await?;
     Ok(SwapResponse {
         server_url: worker_server_url(&conn.gradient_url)?,

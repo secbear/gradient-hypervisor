@@ -29,6 +29,7 @@ pub struct Connection {
     pub max_launches_per_kind: u32,
     pub worker_substituters: Vec<String>,
     pub worker_trusted_public_keys: Vec<String>,
+    pub worker_capabilities: WorkerCapabilities,
     pub idle_timeout: u64,
     pub max_lifetime: u64,
     pub launcher: LauncherConfig,
@@ -38,6 +39,26 @@ pub struct Connection {
 pub enum LauncherConfig {
     GitHubActions(GitHubActions),
     Kubernetes(Kubernetes),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkerCapabilities {
+    pub build: bool,
+    pub network: bool,
+    pub secrets: bool,
+    pub eval: bool,
+}
+
+impl Default for WorkerCapabilities {
+    fn default() -> Self {
+        Self {
+            build: true,
+            network: true,
+            secrets: true,
+            eval: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -104,6 +125,8 @@ struct ConnectionFields {
     worker_substituters: Vec<String>,
     #[serde(default)]
     worker_trusted_public_keys: Vec<String>,
+    #[serde(default)]
+    worker_capabilities: WorkerCapabilities,
     #[serde(default = "default_idle_timeout")]
     idle_timeout: u64,
     #[serde(default = "default_max_lifetime")]
@@ -190,6 +213,7 @@ impl TryFrom<ConnectionFields> for Connection {
             max_launches_per_kind: fields.max_launches_per_kind,
             worker_substituters: fields.worker_substituters,
             worker_trusted_public_keys: fields.worker_trusted_public_keys,
+            worker_capabilities: fields.worker_capabilities,
             idle_timeout: fields.idle_timeout,
             max_lifetime: fields.max_lifetime,
             launcher,
@@ -302,6 +326,56 @@ mod tests {
         let uppercase = KUBERNETES.replace("\"x86\"", "\"X86\"");
         assert!(error_of(&connection("a", &empty)).contains("at least one pool"));
         assert!(error_of(&connection("a", &uppercase)).contains("pool name"));
+    }
+
+    #[test]
+    fn partial_worker_capabilities_preserve_unspecified_defaults() {
+        let entry = connection("a", KUBERNETES).replace(
+            "\"name\":\"a\"",
+            "\"name\":\"a\",\"workerCapabilities\":{\"eval\":false,\"secrets\":false}",
+        );
+        let config = Config::parse(&with_connections(&entry)).unwrap();
+        assert_eq!(
+            config.connections[0].worker_capabilities,
+            WorkerCapabilities {
+                eval: false,
+                secrets: false,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn omitted_and_empty_worker_capabilities_preserve_all_roles() {
+        for launcher in [GITHUB, KUBERNETES] {
+            let entry = connection("a", launcher);
+            for entry in [
+                entry.clone(),
+                entry.replace("\"name\":\"a\"", "\"name\":\"a\",\"workerCapabilities\":{}"),
+            ] {
+                let config = Config::parse(&with_connections(&entry)).unwrap();
+                assert_eq!(
+                    config.connections[0].worker_capabilities,
+                    WorkerCapabilities {
+                        build: true,
+                        network: true,
+                        secrets: true,
+                        eval: true,
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn worker_capabilities_reject_unknown_roles_and_non_booleans() {
+        for capabilities in [r#"{"secret":false}"#, r#"{"eval":"false"}"#] {
+            let entry = connection("a", KUBERNETES).replace(
+                "\"name\":\"a\"",
+                &format!("\"name\":\"a\",\"workerCapabilities\":{capabilities}"),
+            );
+            assert!(Config::parse(&with_connections(&entry)).is_err());
+        }
     }
 
     #[test]

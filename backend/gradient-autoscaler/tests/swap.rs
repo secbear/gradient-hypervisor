@@ -1,6 +1,6 @@
 mod common;
 
-use gradient_autoscaler::config::{Connection, LauncherConfig};
+use gradient_autoscaler::config::{Connection, LauncherConfig, WorkerCapabilities};
 use gradient_autoscaler::github::oidc::{AUDIENCE, OidcVerifier, VerifyError};
 use gradient_autoscaler::github::swap::{SwapError, swap};
 use gradient_autoscaler::gradient::GradientClient;
@@ -124,7 +124,12 @@ impl Fixture {
 #[tokio::test]
 async fn valid_token_swaps_once() {
     let fixture = fixture().await;
-    let conn = github_connection(&fixture.gradient.uri());
+    let mut conn = github_connection(&fixture.gradient.uri());
+    conn.worker_capabilities = WorkerCapabilities {
+        eval: false,
+        secrets: false,
+        ..Default::default()
+    };
     let claims = fixture
         .verifier()
         .verify(&fixture.valid_token(), AUDIENCE)
@@ -158,6 +163,10 @@ async fn valid_token_swaps_once() {
     let body: Value = serde_json::from_slice(&registration.body).unwrap();
     assert_eq!(body["worker_id"], response.worker_id.to_string());
     assert_eq!(body["display_name"], "gha-4242-1");
+    assert_eq!(body["enable_build"], true);
+    assert_eq!(body["enable_network"], true);
+    assert_eq!(body["enable_eval"], false);
+    assert_eq!(body["enable_secrets"], false);
 }
 
 #[tokio::test]

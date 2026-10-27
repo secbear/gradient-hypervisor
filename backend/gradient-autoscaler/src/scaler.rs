@@ -10,7 +10,8 @@ pub async fn scale(svc: &Arc<ConnectionService>) -> anyhow::Result<()> {
     let demand = svc
         .gradient
         .team_demand(&conn.team, conn.projects.as_deref())
-        .await?;
+        .await?
+        .restricted_to(conn.worker_capabilities);
     let open = svc.state.open_launches(&conn.name).await?;
     let kinds = svc.kinds().await?;
     let backoff = backed_off_labels(&svc.state, &conn.name, &kinds).await?;

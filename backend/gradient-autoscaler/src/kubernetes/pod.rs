@@ -1,4 +1,4 @@
-use crate::config::{Kubernetes, Pool};
+use crate::config::{Kubernetes, Pool, WorkerCapabilities};
 use crate::kubernetes::client::Pod;
 use crate::launcher::Progress;
 use serde_json::{Map, Value, json};
@@ -29,6 +29,7 @@ pub struct WorkerPod<'a> {
     pub idle_timeout: u64,
     pub max_lifetime: u64,
     pub nix_config: Option<String>,
+    pub capabilities: WorkerCapabilities,
 }
 
 pub fn pod_name(launch_id: Uuid) -> String {
@@ -86,6 +87,22 @@ impl WorkerPod<'_> {
             ("GRADIENT_WORKER_ID", self.worker_id.to_string()),
             ("GRADIENT_WORKER_PEERS_FILE", format!("{PEERS_DIR}/peers")),
             ("GRADIENT_WORKER_BASE_DIR", STATE_DIR.to_owned()),
+            (
+                "GRADIENT_WORKER_CAPABILITIES_BUILD",
+                self.capabilities.build.to_string(),
+            ),
+            (
+                "GRADIENT_WORKER_CAPABILITIES_NETWORK",
+                self.capabilities.network.to_string(),
+            ),
+            (
+                "GRADIENT_WORKER_CAPABILITIES_SECRETS",
+                self.capabilities.secrets.to_string(),
+            ),
+            (
+                "GRADIENT_WORKER_CAPABILITIES_EVAL",
+                self.capabilities.eval.to_string(),
+            ),
             (
                 "GRADIENT_WORKER_BUILD_MAX_CONCURRENT",
                 self.pool.max_jobs.to_string(),
@@ -218,6 +235,7 @@ mod tests {
             idle_timeout: 120,
             max_lifetime: 3600,
             nix_config: nix_config(&["https://cache.example.com".into()], &[]),
+            capabilities: WorkerCapabilities::default(),
         }
     }
 

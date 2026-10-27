@@ -50,6 +50,7 @@ pub fn connection(name: &str, gradient_url: &str, launcher: LauncherConfig) -> C
         max_launches_per_kind: 2,
         worker_substituters: vec!["https://cache.example.com".into()],
         worker_trusted_public_keys: vec!["cache.example.com-1:abc=".into()],
+        worker_capabilities: Default::default(),
         idle_timeout: 120,
         max_lifetime: 21600,
         launcher,

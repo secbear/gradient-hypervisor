@@ -100,7 +100,11 @@ async fn register_team_worker_sends_uuid_and_display_name() {
         .and(header("Authorization", "Bearer GRADkey"))
         .and(body_partial_json(json!({
             "worker_id": worker_id.to_string(),
-            "display_name": "gha-4242-1"
+            "display_name": "gha-4242-1",
+            "enable_build": true,
+            "enable_network": true,
+            "enable_eval": true,
+            "enable_secrets": true,
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "error": false,

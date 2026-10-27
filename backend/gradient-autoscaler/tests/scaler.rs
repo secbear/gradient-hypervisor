@@ -1,8 +1,10 @@
 mod common;
 
+use gradient_autoscaler::config::WorkerCapabilities;
 use gradient_autoscaler::scaler::scale;
 use gradient_autoscaler::state::{Launch, LaunchState};
 use serde_json::{Value, json};
+use std::sync::Arc;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -88,4 +90,35 @@ async fn scale_cancels_queued_run_once_demand_is_gone() {
 
     let stored = svc.state.launch("ops", launch.id).await.unwrap().unwrap();
     assert_eq!(stored.state, LaunchState::Cancelled);
+}
+
+#[tokio::test]
+async fn scale_does_not_launch_for_only_disabled_roles() {
+    for capabilities in [
+        WorkerCapabilities {
+            eval: false,
+            secrets: false,
+            ..Default::default()
+        },
+        WorkerCapabilities {
+            eval: false,
+            network: false,
+            ..Default::default()
+        },
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/teams/ops/workers/demand"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": { "builds": [], "network": 0, "secrets": 1, "eval": 2 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut svc = common::github_service(&server.uri()).await;
+        Arc::get_mut(&mut svc).unwrap().conn.worker_capabilities = capabilities;
+        scale(&svc).await.unwrap();
+        assert!(svc.state.open_launches("ops").await.unwrap().is_empty());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
 }
