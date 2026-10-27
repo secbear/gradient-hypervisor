@@ -87,6 +87,10 @@ impl WorkerPod<'_> {
             ("GRADIENT_WORKER_PEERS_FILE", format!("{PEERS_DIR}/peers")),
             ("GRADIENT_WORKER_BASE_DIR", STATE_DIR.to_owned()),
             (
+                "GRADIENT_WORKER_BUILD_MAX_CONCURRENT",
+                self.pool.max_jobs.to_string(),
+            ),
+            (
                 "GRADIENT_WORKER_IDLE_TIMEOUT",
                 self.idle_timeout.to_string(),
             ),
@@ -322,5 +326,16 @@ mod tests {
         for (pod, expected) in cases {
             assert_eq!(progress_of(pod.as_ref()), expected, "{pod:?}");
         }
+    }
+
+    #[test]
+    fn pod_enforces_the_pool_build_slots() {
+        let (cluster, mut pool) = (cluster(), pool());
+        pool.max_jobs = 2;
+        let manifest = worker_pod(&cluster, &pool).manifest();
+        assert_eq!(
+            env_of(&manifest)["GRADIENT_WORKER_BUILD_MAX_CONCURRENT"],
+            "2"
+        );
     }
 }
