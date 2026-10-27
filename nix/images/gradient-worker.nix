@@ -1,5 +1,4 @@
-{ lib
-, bashInteractive
+{ bashInteractive
 , buildEnv
 , cacert
 , closureInfo
@@ -10,9 +9,16 @@
 , gradient-nix
 , openssh
 , runCommand
+, writeShellScriptBin
 , writeTextDir
 }:
 let
+  entrypoint = writeShellScriptBin "gradient-worker-entrypoint" ''
+    # The worker's store client connects to the local Nix daemon.
+    nix-daemon --store local &
+    exec gradient-worker "$@"
+  '';
+
   nixConf = writeTextDir "etc/nix/nix.conf" ''
     experimental-features = nix-command flakes
     build-users-group =
@@ -30,7 +36,7 @@ let
 
   root = buildEnv {
     name = "gradient-worker-root";
-    paths = [ bashInteractive cacert coreutils git gradient gradient-nix openssh nixConf users ];
+    paths = [ bashInteractive cacert coreutils git gradient gradient-nix openssh nixConf users entrypoint ];
     pathsToLink = [ "/bin" "/etc" ];
   };
 in
@@ -49,7 +55,7 @@ dockerTools.buildLayeredImage {
   '';
 
   config = {
-    Entrypoint = [ (lib.getExe' gradient "gradient-worker") ];
+    Entrypoint = [ "${entrypoint}/bin/gradient-worker-entrypoint" ];
     WorkingDir = "/var/lib/gradient-worker";
     Env = [
       "PATH=/bin"
