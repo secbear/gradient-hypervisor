@@ -1,3 +1,4 @@
+use gradient_autoscaler::config::WorkerCapabilities;
 use gradient_autoscaler::github::client::{DispatchInputs, GitHubClient};
 use gradient_autoscaler::gradient::{GradientClient, UnmetRequirement};
 use serde_json::json;
@@ -92,35 +93,75 @@ async fn dispatch_errors_on_204_or_4xx() {
 
 #[tokio::test]
 async fn register_team_worker_sends_uuid_and_display_name() {
-    let server = MockServer::start().await;
     let worker_id = Uuid::new_v4();
     let team_id = Uuid::new_v4();
-    Mock::given(method("POST"))
-        .and(path("/api/v1/teams/ops/workers"))
-        .and(header("Authorization", "Bearer GRADkey"))
-        .and(body_partial_json(json!({
-            "worker_id": worker_id.to_string(),
-            "display_name": "gha-4242-1",
-            "enable_build": true,
-            "enable_network": true,
-            "enable_eval": true,
-            "enable_secrets": true,
-            "enable_exec": false,
-        })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "error": false,
-            "message": { "team": team_id, "token": "secret-token" }
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
+    for (capabilities, expected) in [
+        (
+            None,
+            json!({
+                "enable_build": true,
+                "enable_network": true,
+                "enable_eval": true,
+                "enable_secrets": true,
+                "enable_exec": false,
+            }),
+        ),
+        (
+            Some(WorkerCapabilities {
+                build: false,
+                network: false,
+                secrets: false,
+                exec: true,
+                eval: false,
+            }),
+            json!({
+                "enable_build": false,
+                "enable_network": false,
+                "enable_eval": false,
+                "enable_secrets": false,
+                "enable_exec": true,
+            }),
+        ),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/teams/ops/workers"))
+            .and(header("Authorization", "Bearer GRADkey"))
+            .and(body_partial_json(json!({
+                "worker_id": worker_id.to_string(),
+                "display_name": "gha-4242-1",
+            })))
+            .and(body_partial_json(expected))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "error": false,
+                "message": { "team": team_id, "token": "secret-token" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
 
-    let registered = gradient(&server)
-        .register_team_worker("ops", worker_id, "gha-4242-1")
-        .await
+        let client = gradient(&server);
+        let registered = match capabilities {
+            Some(capabilities) => {
+                client
+                    .register_team_worker_with_capabilities(
+                        "ops",
+                        worker_id,
+                        "gha-4242-1",
+                        capabilities,
+                    )
+                    .await
+            }
+            None => {
+                client
+                    .register_team_worker("ops", worker_id, "gha-4242-1")
+                    .await
+            }
+        }
         .unwrap();
-    assert_eq!(registered.team, team_id);
-    assert_eq!(registered.token, "secret-token");
+        assert_eq!(registered.team, team_id);
+        assert_eq!(registered.token, "secret-token");
+    }
 }
 
 #[tokio::test]

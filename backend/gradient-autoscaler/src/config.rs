@@ -1,5 +1,5 @@
 use anyhow::{Context, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -41,13 +41,18 @@ pub enum LauncherConfig {
     Kubernetes(Kubernetes),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkerCapabilities {
+    #[serde(rename(serialize = "enable_build"))]
     pub build: bool,
+    #[serde(rename(serialize = "enable_network"))]
     pub network: bool,
+    #[serde(rename(serialize = "enable_secrets"))]
     pub secrets: bool,
+    #[serde(rename(serialize = "enable_exec"))]
     pub exec: bool,
+    #[serde(rename(serialize = "enable_eval"))]
     pub eval: bool,
 }
 
@@ -382,6 +387,7 @@ mod tests {
             r#"{"secret":false}"#,
             r#"{"eval":"false"}"#,
             r#"{"exec":"false"}"#,
+            r#"{"enable_build":false}"#,
         ] {
             let entry = connection("a", KUBERNETES).replace(
                 "\"name\":\"a\"",

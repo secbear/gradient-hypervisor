@@ -1,8 +1,8 @@
 use crate::config::WorkerCapabilities;
 use crate::rest::send;
 use reqwest::{Client, Method};
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use url::Url;
 use uuid::Uuid;
@@ -27,14 +27,14 @@ impl TeamDemand {
         if !caps.build {
             self.builds.clear();
         }
-        if !caps.network {
-            self.network = 0;
-        }
-        if !caps.network || !caps.secrets {
-            self.secrets = 0;
-        }
-        if !caps.eval {
-            self.eval = 0;
+        for (enabled, count) in [
+            (caps.network, &mut self.network),
+            (caps.network && caps.secrets, &mut self.secrets),
+            (caps.eval, &mut self.eval),
+        ] {
+            if !enabled {
+                *count = 0;
+            }
         }
         self
     }
@@ -94,6 +94,14 @@ struct ServerConfig {
 struct RegisteredTeamWorker {
     team: Uuid,
     token: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RegisterTeamWorkerRequest<'a> {
+    worker_id: Uuid,
+    display_name: &'a str,
+    #[serde(flatten)]
+    capabilities: WorkerCapabilities,
 }
 
 #[derive(Deserialize)]
@@ -185,15 +193,11 @@ impl GradientClient {
     ) -> anyhow::Result<RegisteredWorker> {
         let request = self
             .request(Method::POST, &format!("/api/v1/teams/{team}/workers"))
-            .json(&json!({
-                "worker_id": worker_id.to_string(),
-                "display_name": display_name,
-                "enable_network": capabilities.network,
-                "enable_secrets": capabilities.secrets,
-                "enable_exec": capabilities.exec,
-                "enable_eval": capabilities.eval,
-                "enable_build": capabilities.build,
-            }));
+            .json(&RegisterTeamWorkerRequest {
+                worker_id,
+                display_name,
+                capabilities,
+            });
         let registered: RegisteredTeamWorker = self.message(request).await?;
         let token = registered.token.ok_or_else(|| {
             anyhow::anyhow!("Gradient registered worker {worker_id} without a token")
