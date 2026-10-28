@@ -12,15 +12,6 @@ Starts temporary Gradient team workers when connected workers cannot handle wait
 - The service deletes the team worker of a launch after the launch ends, and only deletes workers it registered.
 - Two launches of one runner label or pool that end without their worker connecting within 30 minutes pause that label for 10 minutes.
 
-Each connection can set `workerCapabilities` for worker registration with either launcher.
-Build, network, secrets and eval default to `true`. Exec defaults to `false`.
-These defaults also apply to omitted members of a partial configuration.
-Kubernetes workers receive matching environment settings. The autoscaler excludes disabled-role
-demand before planning launches.
-
-For Gradient's capability definitions, see
-https://github.com/wavelens/gradient/blob/ed9cd2c7f33d264a567f704edfb50fa9881a9db1/docs/src/concepts/workers.md#capabilities
-
 ### Kubernetes
 
 - Each pool in `kubernetes.pools` is one kind of worker pod with its system, features, job slots, resources, node selector and tolerations.

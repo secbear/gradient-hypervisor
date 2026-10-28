@@ -247,19 +247,13 @@ let
       workerCapabilities = mkOption {
         default = { };
         type = types.submodule {
-          options = lib.genAttrs [ "build" "network" "secrets" "eval" ] (role: mkOption {
-            type = types.bool;
+          options = lib.genAttrs [ "build" "network" "secrets" "eval" ] (role: mkEnableOption "the ${role} worker capability" // {
             default = true;
-            description = "Whether this connection grants workers the ${role} capability.";
           }) // {
             exec = mkEnableOption "the exec worker capability";
           };
         };
-        description = ''
-          Capabilities granted at worker registration. All options except exec default to true.
-          Kubernetes workers receive matching runtime settings. Demand for disabled roles is excluded
-          before planning launches.
-        '';
+        description = "Capabilities granted to workers.";
       };
 
       idleTimeout = mkOption {
