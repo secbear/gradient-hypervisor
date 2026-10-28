@@ -13,7 +13,8 @@ Starts temporary Gradient team workers when connected workers cannot handle wait
 - Two launches of one runner label or pool that end without their worker connecting within 30 minutes pause that label for 10 minutes.
 
 Each connection can set `workerCapabilities` for worker registration with either launcher.
-All options default to `true`, including omitted members of a partial configuration.
+Build, network, secrets and eval default to `true`. Exec defaults to `false`.
+These defaults also apply to omitted members of a partial configuration.
 Kubernetes workers receive matching environment settings. The autoscaler excludes disabled-role
 demand before planning launches.
 

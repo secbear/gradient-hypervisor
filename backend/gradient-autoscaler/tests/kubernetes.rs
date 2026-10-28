@@ -113,6 +113,7 @@ async fn scale_starts_a_pod_whose_secret_holds_the_registered_token() {
         .worker_capabilities = WorkerCapabilities {
         eval: false,
         secrets: false,
+        exec: true,
         ..Default::default()
     };
     let svc = &fixture.svc;
@@ -164,6 +165,7 @@ async fn scale_starts_a_pod_whose_secret_holds_the_registered_token() {
     assert_eq!(registration["enable_network"], true);
     assert_eq!(registration["enable_eval"], false);
     assert_eq!(registration["enable_secrets"], false);
+    assert_eq!(registration["enable_exec"], true);
 
     let manifest = json_of(&received(&server, "POST", PODS).await[0]);
     assert_eq!(manifest["metadata"]["name"], launch.external_id);
@@ -182,6 +184,7 @@ async fn scale_starts_a_pod_whose_secret_holds_the_registered_token() {
         ("NETWORK", "true"),
         ("EVAL", "false"),
         ("SECRETS", "false"),
+        ("EXEC", "true"),
     ] {
         assert!(env.iter().any(|var| {
             var["name"] == format!("GRADIENT_WORKER_CAPABILITIES_{role}") && var["value"] == enabled

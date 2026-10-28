@@ -128,6 +128,7 @@ async fn valid_token_swaps_once() {
     conn.worker_capabilities = WorkerCapabilities {
         eval: false,
         secrets: false,
+        exec: true,
         ..Default::default()
     };
     let claims = fixture
@@ -167,6 +168,7 @@ async fn valid_token_swaps_once() {
     assert_eq!(body["enable_network"], true);
     assert_eq!(body["enable_eval"], false);
     assert_eq!(body["enable_secrets"], false);
+    assert_eq!(body["enable_exec"], true);
 }
 
 #[tokio::test]
