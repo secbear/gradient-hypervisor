@@ -105,6 +105,7 @@ async fn register_team_worker_sends_uuid_and_display_name() {
             "enable_network": true,
             "enable_eval": true,
             "enable_secrets": true,
+            "enable_exec": false,
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "error": false,

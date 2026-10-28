@@ -100,6 +100,10 @@ impl WorkerPod<'_> {
                 self.capabilities.secrets.to_string(),
             ),
             (
+                "GRADIENT_WORKER_CAPABILITIES_EXEC",
+                self.capabilities.exec.to_string(),
+            ),
+            (
                 "GRADIENT_WORKER_CAPABILITIES_EVAL",
                 self.capabilities.eval.to_string(),
             ),
@@ -292,6 +296,7 @@ mod tests {
             manifest["metadata"]["name"]
         );
         assert_eq!(env["GRADIENT_WORKER_ID"], Uuid::from_u128(7).to_string());
+        assert_eq!(env["GRADIENT_WORKER_CAPABILITIES_EXEC"], "false");
         assert_eq!(
             env["GRADIENT_WORKER_PEERS_FILE"],
             "/run/secrets/gradient/peers"

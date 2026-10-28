@@ -190,6 +190,7 @@ impl GradientClient {
                 "display_name": display_name,
                 "enable_network": capabilities.network,
                 "enable_secrets": capabilities.secrets,
+                "enable_exec": capabilities.exec,
                 "enable_eval": capabilities.eval,
                 "enable_build": capabilities.build,
             }));
@@ -313,6 +314,7 @@ mod tests {
                 build: false,
                 network: false,
                 secrets: false,
+                exec: false,
                 eval: false,
             }),
             TeamDemand::default()

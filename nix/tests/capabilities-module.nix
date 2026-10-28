@@ -1,6 +1,6 @@
 { pkgs, runCommand, jq, nixosModule }:
 let
-  evaluated = import (pkgs.path + "/nixos/lib/eval-config.nix") {
+  evaluated = capabilities: import (pkgs.path + "/nixos/lib/eval-config.nix") {
     inherit pkgs;
     system = pkgs.stdenv.hostPlatform.system;
     modules = [
@@ -14,7 +14,7 @@ let
             gradientUrl = "https://gradient.example.com";
             team = "platform";
             apiKeyFile = "/run/secrets/gradient-api-key";
-            workerCapabilities = { eval = false; secrets = false; };
+            workerCapabilities = { eval = false; secrets = false; } // capabilities;
             kubernetes = {
               tokenFile = "/run/secrets/kubernetes-token";
               namespace = "gradient-workers";
@@ -26,9 +26,11 @@ let
       }
     ];
   };
-  configFile = evaluated.config.systemd.services.gradient-autoscaler.environment.GRADIENT_AUTOSCALER_CONFIG;
+  configFile = capabilities: (evaluated capabilities).config.systemd.services.gradient-autoscaler.environment.GRADIENT_AUTOSCALER_CONFIG;
 in
 runCommand "gradient-autoscaler-capabilities-module" { nativeBuildInputs = [ jq ]; } ''
   jq -e '.connections[0].workerCapabilities ==
-    {"build": true, "network": true, "secrets": false, "eval": false}' ${configFile} >$out
+    {"build": true, "network": true, "secrets": false, "exec": false, "eval": false}' ${configFile { }}
+  jq -e '.connections[0].workerCapabilities ==
+    {"build": true, "network": true, "secrets": false, "exec": true, "eval": false}' ${configFile { exec = true; }} >$out
 ''
