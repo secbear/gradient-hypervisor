@@ -24,9 +24,9 @@ pub struct TeamDemand {
 
 impl TeamDemand {
     pub fn restricted_to(mut self, caps: WorkerCapabilities) -> Self {
-        if !caps.build {
-            self.builds.clear();
-        }
+        self.builds.retain(|requirement| {
+            (!requirement.build || caps.build) && (!requirement.network || caps.network)
+        });
         for (enabled, count) in [
             (caps.network, &mut self.network),
             (caps.network && caps.secrets, &mut self.secrets),
@@ -45,6 +45,14 @@ pub struct UnmetRequirement {
     pub architecture: String,
     pub required_features: Vec<String>,
     pub build_count: u32,
+    #[serde(default = "default_true")]
+    pub build: bool,
+    #[serde(default)]
+    pub network: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -284,6 +292,8 @@ mod tests {
                 architecture: "x86_64-linux".into(),
                 required_features: vec![],
                 build_count: 4,
+                build: true,
+                network: false,
             }],
         };
         assert_eq!(
@@ -323,5 +333,71 @@ mod tests {
             }),
             TeamDemand::default()
         );
+    }
+
+    #[test]
+    fn demand_requirements_decode_legacy_and_explicit_capabilities() {
+        for (flags, build, network) in [
+            (json!({}), true, false),
+            (json!({"build": false, "network": true}), false, true),
+            (json!({"build": true, "network": true}), true, true),
+            (json!({"build": false}), false, false),
+            (json!({"network": true}), true, true),
+        ] {
+            let mut requirement = json!({
+                "architecture": "builtin", "required_features": ["kvm"], "build_count": 2
+            });
+            requirement
+                .as_object_mut()
+                .unwrap()
+                .extend(flags.as_object().unwrap().clone());
+            let demand: TeamDemand = serde_json::from_value(json!({
+                "builds": [requirement], "network": 0, "secrets": 0, "eval": 0
+            }))
+            .unwrap();
+            assert_eq!(
+                demand.builds,
+                [UnmetRequirement {
+                    architecture: "builtin".into(),
+                    required_features: vec!["kvm".into()],
+                    build_count: 2,
+                    build,
+                    network,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn demand_requires_each_requested_capability() {
+        let demand = TeamDemand {
+            builds: [(true, false), (true, true), (false, true)]
+                .into_iter()
+                .map(|(build, network)| UnmetRequirement {
+                    architecture: "builtin".into(),
+                    required_features: vec!["kvm".into()],
+                    build_count: 2,
+                    build,
+                    network,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        for (build, network, expected) in [
+            (false, false, vec![]),
+            (true, false, vec![demand.builds[0].clone()]),
+            (false, true, vec![demand.builds[2].clone()]),
+            (true, true, demand.builds.clone()),
+        ] {
+            let restricted = demand.clone().restricted_to(WorkerCapabilities {
+                build,
+                network,
+                ..Default::default()
+            });
+            assert_eq!(
+                restricted.builds, expected,
+                "build={build}, network={network}"
+            );
+        }
     }
 }

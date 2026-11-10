@@ -43,12 +43,23 @@ pub fn plan(
     backoff: &HashSet<String>,
 ) -> Plan {
     let mut planner = Planner::new(open, kinds, limits, backoff);
-    for requirement in demand.builds.iter().filter(|r| r.build_count > 0) {
-        planner.cover_build(&requirement.architecture, &requirement.required_features);
+    let mut build_requirements = HashSet::new();
+    for requirement in demand
+        .builds
+        .iter()
+        .filter(|r| r.build_count > 0 && r.build)
+    {
+        if build_requirements.insert((&requirement.architecture, &requirement.required_features)) {
+            planner.cover_build(&requirement.architecture, &requirement.required_features);
+        }
     }
 
     if demand.network > 0 || demand.secrets > 0 || demand.eval > 0 {
         planner.cover_network_and_eval();
+    }
+
+    if demand.builds.iter().any(|r| r.build_count > 0 && !r.build) {
+        planner.cover_transfer();
     }
 
     planner.cancel_unneeded();
@@ -159,6 +170,29 @@ impl<'a> Planner<'a> {
         unknown.iter().any(|kind| self.try_launch(&kind.label, 1))
     }
 
+    fn cover_transfer(&mut self) {
+        let covers_transfer = |kind: Option<&Kind>| {
+            kind.and_then(|k| k.profile.as_ref())
+                .is_some_and(|p| covers(p, "builtin", &[]))
+        };
+        // Transfers share build capacity without architecture or feature requirements.
+        if let Some(i) =
+            (0..self.open.len()).find(|&i| covers_transfer(self.kind(&self.open[i].label)))
+        {
+            self.used[i] = true;
+            return;
+        }
+        if self
+            .plan
+            .launch
+            .iter()
+            .any(|label| covers_transfer(self.kind(label)))
+        {
+            return;
+        }
+        self.cover_build("builtin", &[]);
+    }
+
     fn cover_network_and_eval(&mut self) {
         let runs_linux = |kind: Option<&Kind>| {
             kind.and_then(|k| k.profile.as_ref())
@@ -234,6 +268,8 @@ mod tests {
                     architecture: (*system).into(),
                     required_features: features.iter().map(|f| (*f).into()).collect(),
                     build_count: 5,
+                    build: true,
+                    network: false,
                 })
                 .collect(),
             network: 0,
@@ -266,21 +302,39 @@ mod tests {
             ["ubuntu-latest", "ubuntu-latest", "ubuntu-24.04-arm"]
         );
         assert!(plan.cancel.is_empty() && plan.uncovered.is_empty());
+
+        let mut demand = demand;
+        let mut fixed_output = demand.builds[0].clone();
+        fixed_output.network = true;
+        demand.builds.insert(0, fixed_output);
+        let combined = super::plan(&demand, &[], &standard_kinds(), &limits(), &no_backoff());
+        assert_eq!(combined, plan);
     }
 
     #[test]
     fn existing_open_launch_covers_requirement() {
         let launches = [open("ubuntu-latest", 1, LaunchState::Queued)];
         for system in ["x86_64-linux", "builtin"] {
-            let demand = builds(&[(system, &["kvm"])]);
-            let plan = plan(
-                &demand,
-                &launches,
-                &standard_kinds(),
-                &limits(),
-                &no_backoff(),
-            );
-            assert_eq!(plan, Plan::default(), "{system}");
+            for split_network in [false, true] {
+                let mut demand = builds(&[(system, &["kvm"])]);
+                if split_network {
+                    let mut fixed_output = demand.builds[0].clone();
+                    fixed_output.network = true;
+                    demand.builds.push(fixed_output);
+                }
+                let plan = plan(
+                    &demand,
+                    &launches,
+                    &standard_kinds(),
+                    &limits(),
+                    &no_backoff(),
+                );
+                assert_eq!(
+                    plan,
+                    Plan::default(),
+                    "{system}: split_network={split_network}"
+                );
+            }
         }
     }
 
@@ -292,6 +346,98 @@ mod tests {
         let plan = plan(&demand, &[], &standard_kinds(), &limits, &no_backoff());
         assert_eq!(plan.launch, ["ubuntu-latest"]);
         assert!(plan.cancel.is_empty() && plan.uncovered.is_empty());
+    }
+
+    #[test]
+    fn transfers_ignore_architecture_and_features_and_share_build_launches() {
+        let mut demand = builds(&[("riscv64-linux", &["cuda"]), ("aarch64-linux", &[])]);
+        demand.builds[0].build = false;
+        demand.builds[0].network = true;
+        for mixed in [false, true] {
+            let mut demand = demand.clone();
+            if mixed {
+                demand.eval = 1;
+                demand.network = 1;
+                demand.secrets = 1;
+            } else {
+                demand.builds.pop();
+            }
+            let mut limits = limits();
+            limits.allowed = vec!["ubuntu-24.04-arm".into()];
+            let first = plan(&demand, &[], &standard_kinds(), &limits, &no_backoff());
+            assert_eq!(first.launch, ["ubuntu-24.04-arm"], "mixed={mixed}");
+            assert!(first.cancel.is_empty() && first.uncovered.is_empty());
+
+            let launches = [open("ubuntu-24.04-arm", 1, LaunchState::Queued)];
+            assert_eq!(
+                plan(
+                    &demand,
+                    &launches,
+                    &standard_kinds(),
+                    &limits,
+                    &no_backoff()
+                ),
+                Plan::default(),
+                "mixed={mixed}"
+            );
+        }
+        demand.builds.pop();
+        demand.builds[0].build_count = 0;
+        assert_eq!(
+            plan(&demand, &[], &standard_kinds(), &limits(), &no_backoff()),
+            Plan::default()
+        );
+    }
+
+    #[test]
+    fn transfers_cover_non_linux_and_empty_profiles() {
+        let mut demand = builds(&[("x86_64-linux", &["cuda"])]);
+        demand.builds[0].build = false;
+        demand.builds[0].network = true;
+        for systems in [vec!["aarch64-darwin".into()], vec![]] {
+            let mut kinds = vec![Kind {
+                label: "transfer".into(),
+                cost: 0,
+                profile: Some(crate::kinds::Profile {
+                    systems,
+                    features: vec![],
+                    max_jobs: 1,
+                    ram_mb: None,
+                }),
+            }];
+            let mut limits = limits();
+            limits.allowed = vec!["transfer".into()];
+            let first = plan(&demand, &[], &kinds, &limits, &no_backoff());
+            assert_eq!(first.launch, ["transfer"]);
+            assert!(first.uncovered.is_empty());
+            let launches = [open("transfer", 1, LaunchState::Queued)];
+            assert_eq!(
+                plan(&demand, &launches, &kinds, &limits, &no_backoff()),
+                Plan::default()
+            );
+            kinds.push(Kind {
+                label: "linux".into(),
+                cost: 1,
+                profile: Some(crate::kinds::Profile::new("x86_64-linux", &[], 1, None)),
+            });
+            limits.allowed.push("linux".into());
+            limits.max_launches = 1;
+            for (network, eval) in [(0, 1), (1, 0)] {
+                let mixed = TeamDemand {
+                    network,
+                    eval,
+                    ..demand.clone()
+                };
+                let first = plan(&mixed, &[], &kinds, &limits, &no_backoff());
+                assert_eq!(first.launch, ["linux"]);
+                assert!(first.cancel.is_empty() && first.uncovered.is_empty());
+                let launches = [open("linux", 1, LaunchState::Queued)];
+                assert_eq!(
+                    plan(&mixed, &launches, &kinds, &limits, &no_backoff()),
+                    Plan::default()
+                );
+            }
+        }
     }
 
     #[test]
@@ -338,6 +484,29 @@ mod tests {
         let demand = builds(&[("aarch64-linux", &[]), ("x86_64-linux", &[])]);
         let plan = plan(&demand, &[], &standard_kinds(), &limits(), &backoff);
         assert_eq!(plan.launch, ["ubuntu-latest"]);
+
+        let mut transfer = builds(&[("riscv64-linux", &["cuda"])]);
+        transfer.builds[0].build = false;
+        transfer.builds[0].network = true;
+        assert_eq!(
+            super::plan(&transfer, &[], &standard_kinds(), &limits(), &backoff).launch,
+            ["ubuntu-latest"]
+        );
+        let mut blocked = limits();
+        blocked.allowed = vec!["ubuntu-24.04-arm".into()];
+        let plan = super::plan(&transfer, &[], &standard_kinds(), &blocked, &backoff);
+        assert!(plan.launch.is_empty());
+        assert_eq!(plan.uncovered, [("builtin".into(), vec![])]);
+        blocked.allowed = vec!["ubuntu-latest".into()];
+        for (total, per_kind) in [(0, 2), (4, 0)] {
+            blocked.max_launches = total;
+            blocked.max_launches_per_kind = per_kind;
+            assert!(
+                super::plan(&transfer, &[], &standard_kinds(), &blocked, &no_backoff())
+                    .launch
+                    .is_empty()
+            );
+        }
     }
 
     #[test]
@@ -399,14 +568,22 @@ mod tests {
         });
         let mut limits = limits();
         limits.allowed.push("rack-1".into());
-        let demand = builds(&[("riscv64-linux", &[]), ("x86_64-linux", &["cuda"])]);
+        for transfer in [false, true] {
+            let mut demand = builds(&[("riscv64-linux", &[]), ("x86_64-linux", &["cuda"])]);
+            if transfer {
+                for requirement in &mut demand.builds {
+                    requirement.build = false;
+                    requirement.network = true;
+                }
+                limits.allowed = vec!["rack-1".into()];
+            }
+            let first = plan(&demand, &[], &kinds, &limits, &no_backoff());
+            assert_eq!(first.launch, ["rack-1"], "transfer={transfer}");
 
-        let first = plan(&demand, &[], &kinds, &limits, &no_backoff());
-        assert_eq!(first.launch, ["rack-1"]);
-
-        let trial = [open("rack-1", 9, LaunchState::Queued)];
-        let second = plan(&demand, &trial, &kinds, &limits, &no_backoff());
-        assert!(second.launch.is_empty() && second.cancel.is_empty());
+            let trial = [open("rack-1", 9, LaunchState::Queued)];
+            let second = plan(&demand, &trial, &kinds, &limits, &no_backoff());
+            assert!(second.launch.is_empty() && second.cancel.is_empty());
+        }
     }
 
     #[tokio::test]

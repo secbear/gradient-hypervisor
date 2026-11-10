@@ -104,10 +104,9 @@ async fn open_launch_since(
 }
 
 #[tokio::test]
-async fn builtin_demand_starts_a_pod_whose_secret_holds_the_registered_token() {
+async fn scale_starts_a_pod_whose_secret_holds_the_registered_token() {
     let server = MockServer::start().await;
     let mut config = common::kubernetes();
-    config.pools.retain(|name, _| name == "x86");
     config.pools.get_mut("x86").unwrap().pod_options = serde_json::from_value(json!({
         "volumes": [{"name": "fetch-auth", "secret": {"secretName": "worker-fetch-auth"}}],
         "volumeMounts": [{"name": "fetch-auth", "mountPath": "/creds", "readOnly": true}],
@@ -126,7 +125,7 @@ async fn builtin_demand_starts_a_pod_whose_secret_holds_the_registered_token() {
     let svc = &fixture.svc;
     demand(
         &server,
-        json!([{ "architecture": "builtin", "required_features": [], "build_count": 3 }]),
+        json!([{ "architecture": "x86_64-linux", "required_features": ["kvm"], "build_count": 3 }]),
     )
     .await;
     let team = Uuid::from_u128(5);
@@ -220,6 +219,96 @@ async fn builtin_demand_starts_a_pod_whose_secret_holds_the_registered_token() {
         format!("{team}:worker-token\n")
     );
     assert_eq!(secret["metadata"]["ownerReferences"][0]["uid"], "pod-uid");
+}
+
+#[tokio::test]
+async fn scale_honors_build_and_transfer_capabilities_and_retains_pending_pods() {
+    for (architecture, features, build, network, can_build, can_network, expected) in [
+        ("builtin", vec!["kvm"], true, false, true, false, true),
+        ("builtin", vec!["cuda"], true, false, true, true, false),
+        ("builtin", vec![], true, false, false, true, false),
+        ("builtin", vec![], false, true, true, false, false),
+        ("builtin", vec![], true, true, true, false, false),
+        ("x86_64-linux", vec![], true, true, false, true, false),
+        ("x86_64-linux", vec![], true, true, true, false, false),
+        ("x86_64-linux", vec!["kvm"], true, true, true, true, true),
+        (
+            "riscv64-linux",
+            vec!["cuda"],
+            false,
+            true,
+            false,
+            true,
+            true,
+        ),
+    ] {
+        let server = MockServer::start().await;
+        let mut fixture = common::kubernetes_service(&server.uri()).await;
+        Arc::get_mut(&mut fixture.svc)
+            .unwrap()
+            .conn
+            .worker_capabilities = WorkerCapabilities {
+            build: can_build,
+            network: can_network,
+            eval: false,
+            secrets: false,
+            ..Default::default()
+        };
+        demand(
+            &server,
+            json!([{
+                "architecture": architecture, "required_features": features, "build_count": 3,
+                "build": build, "network": network
+            }]),
+        )
+        .await;
+        let times = u64::from(expected);
+        mount(
+            &server,
+            "POST",
+            "/api/v1/teams/ops/workers",
+            envelope(json!({"team": Uuid::nil(), "token": "worker-token"})),
+            Some(times),
+        )
+        .await;
+        mount(
+            &server,
+            "POST",
+            PODS,
+            ResponseTemplate::new(201).set_body_json(json!({
+                "metadata": {"name": "created", "uid": "pod-uid"}
+            })),
+            Some(times),
+        )
+        .await;
+        mount(
+            &server,
+            "POST",
+            SECRETS,
+            ResponseTemplate::new(201),
+            Some(times),
+        )
+        .await;
+
+        scale(&fixture.svc).await.unwrap();
+        let launches = fixture.svc.state.open_launches("ops").await.unwrap();
+        assert_eq!(
+            launches.len(),
+            usize::from(expected),
+            "{architecture}: requires {build}/{network}, supplies {can_build}/{can_network}"
+        );
+        if expected {
+            let registration =
+                json_of(&received(&server, "POST", "/api/v1/teams/ops/workers").await[0]);
+            assert_eq!(registration["enable_build"], can_build);
+            assert_eq!(registration["enable_network"], can_network);
+            scale(&fixture.svc).await.unwrap();
+            assert_eq!(
+                fixture.svc.state.open_launches("ops").await.unwrap(),
+                launches
+            );
+        }
+    }
 }
 
 #[tokio::test]

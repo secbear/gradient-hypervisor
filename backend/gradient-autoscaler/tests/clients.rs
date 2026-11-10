@@ -194,6 +194,8 @@ async fn team_demand_parses_builds_and_eval_gaps() {
             architecture: "aarch64-linux".into(),
             required_features: vec!["kvm".into()],
             build_count: 3,
+            build: true,
+            network: false,
         }]
     );
     assert_eq!((demand.network, demand.secrets, demand.eval), (0, 0, 2));
