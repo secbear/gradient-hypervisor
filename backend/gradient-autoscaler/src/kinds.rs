@@ -37,7 +37,7 @@ pub fn apply_learned(kinds: &mut [Kind], label: &str, profile: Profile) {
 }
 
 pub fn covers(profile: &Profile, system: &str, required: &[String]) -> bool {
-    profile.systems.iter().any(|s| s == system)
+    (system == "builtin" || profile.systems.iter().any(|s| s == system))
         && required
             .iter()
             .all(|feature| profile.features.contains(feature))
@@ -103,23 +103,27 @@ mod tests {
 
     #[test]
     fn covers_requires_all_features() {
-        let profile = Profile::new(
-            "aarch64-linux",
-            &["big-parallel", "nixos-test"],
-            4,
-            Some(16384),
-        );
-        assert!(covers(
-            &profile,
-            "aarch64-linux",
-            &strings(&["big-parallel"])
-        ));
-        assert!(!covers(
-            &profile,
-            "aarch64-linux",
-            &strings(&["big-parallel", "kvm"])
-        ));
-        assert!(!covers(&profile, "x86_64-linux", &[]));
+        for system in ["aarch64-linux", "x86_64-linux", "aarch64-darwin"] {
+            let profile = Profile::new(system, &["big-parallel", "nixos-test"], 4, Some(16384));
+            for requested in [system, "builtin"] {
+                assert!(covers(&profile, requested, &[]), "{system}: {requested}");
+                assert!(
+                    covers(&profile, requested, &strings(&["big-parallel"])),
+                    "{system}: {requested}"
+                );
+                assert!(!covers(
+                    &profile,
+                    requested,
+                    &strings(&["big-parallel", "kvm"])
+                ));
+            }
+            let other = if system == "x86_64-linux" {
+                "aarch64-linux"
+            } else {
+                "x86_64-linux"
+            };
+            assert!(!covers(&profile, other, &[]));
+        }
     }
 
     #[test]

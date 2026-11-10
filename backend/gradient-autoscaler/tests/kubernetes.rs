@@ -104,9 +104,10 @@ async fn open_launch_since(
 }
 
 #[tokio::test]
-async fn scale_starts_a_pod_whose_secret_holds_the_registered_token() {
+async fn builtin_demand_starts_a_pod_whose_secret_holds_the_registered_token() {
     let server = MockServer::start().await;
     let mut config = common::kubernetes();
+    config.pools.retain(|name, _| name == "x86");
     config.pools.get_mut("x86").unwrap().pod_options = serde_json::from_value(json!({
         "volumes": [{"name": "fetch-auth", "secret": {"secretName": "worker-fetch-auth"}}],
         "volumeMounts": [{"name": "fetch-auth", "mountPath": "/creds", "readOnly": true}],
@@ -125,7 +126,7 @@ async fn scale_starts_a_pod_whose_secret_holds_the_registered_token() {
     let svc = &fixture.svc;
     demand(
         &server,
-        json!([{ "architecture": "x86_64-linux", "required_features": ["kvm"], "build_count": 3 }]),
+        json!([{ "architecture": "builtin", "required_features": [], "build_count": 3 }]),
     )
     .await;
     let team = Uuid::from_u128(5);

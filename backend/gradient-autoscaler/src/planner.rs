@@ -271,15 +271,27 @@ mod tests {
     #[test]
     fn existing_open_launch_covers_requirement() {
         let launches = [open("ubuntu-latest", 1, LaunchState::Queued)];
-        let demand = builds(&[("x86_64-linux", &["kvm"])]);
-        let plan = plan(
-            &demand,
-            &launches,
-            &standard_kinds(),
-            &limits(),
-            &no_backoff(),
-        );
-        assert_eq!(plan, Plan::default());
+        for system in ["x86_64-linux", "builtin"] {
+            let demand = builds(&[(system, &["kvm"])]);
+            let plan = plan(
+                &demand,
+                &launches,
+                &standard_kinds(),
+                &limits(),
+                &no_backoff(),
+            );
+            assert_eq!(plan, Plan::default(), "{system}");
+        }
+    }
+
+    #[test]
+    fn builtin_gap_launches_an_allowed_kind() {
+        let demand = builds(&[("builtin", &[])]);
+        let mut limits = limits();
+        limits.allowed = vec!["ubuntu-latest".into()];
+        let plan = plan(&demand, &[], &standard_kinds(), &limits, &no_backoff());
+        assert_eq!(plan.launch, ["ubuntu-latest"]);
+        assert!(plan.cancel.is_empty() && plan.uncovered.is_empty());
     }
 
     #[test]
