@@ -1,3 +1,4 @@
+use crate::capacity::{CapacityAssessment, CapacityAssessmentRequest};
 use crate::config::WorkerCapabilities;
 use crate::rest::send;
 use reqwest::{Client, Method};
@@ -175,6 +176,23 @@ impl GradientClient {
     pub async fn team_workers(&self, team: &str) -> anyhow::Result<Vec<TeamWorker>> {
         self.message(self.request(Method::GET, &format!("/api/v1/teams/{team}/workers")))
             .await
+    }
+
+    pub async fn capacity_assessment(
+        &self,
+        team: &str,
+        assessment: &CapacityAssessmentRequest,
+    ) -> anyhow::Result<CapacityAssessment> {
+        assessment.validate()?;
+        let request = self
+            .request(
+                Method::POST,
+                &format!("/api/v1/teams/{team}/workers/capacity-assessment"),
+            )
+            .json(assessment);
+        let response: CapacityAssessment = self.message(request).await?;
+        response.validate_against(assessment)?;
+        Ok(response)
     }
 
     pub async fn register_team_worker(
