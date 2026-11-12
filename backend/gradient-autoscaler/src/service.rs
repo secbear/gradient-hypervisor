@@ -18,6 +18,14 @@ pub struct ConnectionService {
 }
 
 impl ConnectionService {
+    pub fn ensure_mutations_allowed(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.conn.is_preview(),
+            "worker changes are disabled in build scaling preview"
+        );
+        Ok(())
+    }
+
     pub fn new(
         conn: Connection,
         public_url: Url,

@@ -1,9 +1,13 @@
+use crate::build_planner::BuildScalingPolicy;
+use crate::capacity::{BuildCapacityProfile, BuilderResources, CapacityCapabilities, MAX_PROFILES};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use time::Duration;
 use url::Url;
+use uuid::Uuid;
 
 pub mod pod_options;
 use pod_options::PodOptions;
@@ -36,6 +40,89 @@ pub struct Connection {
     pub idle_timeout: u64,
     pub max_lifetime: u64,
     pub launcher: LauncherConfig,
+    pub build_scaling: Option<BuildScalingConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BuildScalingMode {
+    Preview,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BuildScalingConfig {
+    pub mode: BuildScalingMode,
+    pub profiles: Vec<String>,
+    #[serde(default = "default_queue_wait")]
+    pub queue_wait: u32,
+    #[serde(default = "default_startup_grace")]
+    pub startup_grace: u32,
+    #[serde(default = "default_max_new_workers")]
+    pub max_new_workers: u32,
+    pub fallback_ram_mb: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BuildResources {
+    pub cpu_count: u32,
+    pub ram_total_mb: u64,
+    pub cpu_core_score: u32,
+    #[serde(default)]
+    pub build_cores: Option<u32>,
+}
+
+impl BuildResources {
+    pub(crate) fn for_pool(&self, pool: &Pool) -> BuilderResources {
+        BuilderResources {
+            architectures: vec![pool.system.clone()],
+            system_features: pool.features.clone(),
+            max_concurrent_builds: pool.max_jobs,
+            cpu_count: self.cpu_count,
+            ram_total_mb: self.ram_total_mb,
+            cpu_core_score: self.cpu_core_score,
+            build_cores: self.build_cores,
+        }
+    }
+}
+
+impl BuildScalingConfig {
+    pub fn policy(&self) -> BuildScalingPolicy {
+        BuildScalingPolicy {
+            queue_wait: Duration::seconds(i64::from(self.queue_wait)),
+            startup_grace: Duration::seconds(i64::from(self.startup_grace)),
+            max_new_workers: self.max_new_workers,
+            fallback_ram_mb: self.fallback_ram_mb,
+        }
+    }
+}
+
+impl Connection {
+    pub fn is_preview(&self) -> bool {
+        self.build_scaling
+            .as_ref()
+            .is_some_and(|scaling| scaling.mode == BuildScalingMode::Preview)
+    }
+
+    pub fn capacity_projects(&self) -> anyhow::Result<Option<Vec<Uuid>>> {
+        self.projects
+            .as_ref()
+            .map(|projects| {
+                projects
+                    .iter()
+                    .map(|project| {
+                        Uuid::parse_str(project).with_context(|| {
+                            format!(
+                                "connection {}: build scaling preview needs project IDs, not names",
+                                self.name
+                            )
+                        })
+                    })
+                    .collect()
+            })
+            .transpose()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +219,8 @@ pub struct Pool {
     pub privileged: bool,
     #[serde(default)]
     pub pod_options: PodOptions,
+    #[serde(default)]
+    pub build_resources: Option<BuildResources>,
 }
 
 #[derive(Deserialize)]
@@ -161,6 +250,18 @@ struct ConnectionFields {
     github_actions: Option<GitHubActions>,
     #[serde(default)]
     kubernetes: Option<Kubernetes>,
+    #[serde(default)]
+    build_scaling: Option<BuildScalingConfig>,
+}
+
+fn default_queue_wait() -> u32 {
+    60
+}
+fn default_startup_grace() -> u32 {
+    120
+}
+fn default_max_new_workers() -> u32 {
+    2
 }
 
 fn default_catch_up_interval() -> u64 {
@@ -229,7 +330,7 @@ impl TryFrom<ConnectionFields> for Connection {
             (None, Some(kubernetes)) => LauncherConfig::Kubernetes(kubernetes.validated(&name)?),
             _ => bail!("connection {name}: set exactly one of githubActions and kubernetes"),
         };
-        Ok(Connection {
+        let connection = Connection {
             name,
             gradient_url: fields.gradient_url,
             team: fields.team,
@@ -243,7 +344,57 @@ impl TryFrom<ConnectionFields> for Connection {
             idle_timeout: fields.idle_timeout,
             max_lifetime: fields.max_lifetime,
             launcher,
-        })
+            build_scaling: fields.build_scaling,
+        };
+        if let Some(scaling) = &connection.build_scaling {
+            let LauncherConfig::Kubernetes(kubernetes) = &connection.launcher else {
+                bail!(
+                    "connection {}: build scaling preview requires Kubernetes",
+                    connection.name
+                );
+            };
+            if !connection.worker_capabilities.build
+                || scaling.startup_grace == 0
+                || scaling.fallback_ram_mb == 0
+            {
+                bail!(
+                    "connection {}: preview needs build permission, positive startupGrace and fallbackRamMb",
+                    connection.name
+                );
+            }
+            let alternatives = scaling
+                .profiles
+                .len()
+                .checked_mul(scaling.max_new_workers.max(1) as usize);
+            if scaling.profiles.is_empty() || alternatives.is_none_or(|count| count > MAX_PROFILES)
+            {
+                bail!(
+                    "connection {}: preview accepts at most {MAX_PROFILES} profile alternatives",
+                    connection.name
+                );
+            }
+            let mut selected = HashSet::new();
+            for label in &scaling.profiles {
+                if !selected.insert(label) {
+                    bail!(
+                        "connection {}: duplicate preview profile {label}",
+                        connection.name
+                    );
+                }
+                let pool = kubernetes
+                    .pools
+                    .get(label)
+                    .with_context(|| format!("preview pool {label} is not configured"))?;
+                if pool.build_resources.is_none() {
+                    bail!(
+                        "connection {}: pool {label} needs explicit buildResources for preview",
+                        connection.name
+                    );
+                }
+            }
+            connection.capacity_projects()?;
+        }
+        Ok(connection)
     }
 }
 
@@ -283,6 +434,23 @@ impl Kubernetes {
             pool.pod_options.validate().map_err(|error| {
                 anyhow::anyhow!("connection {connection}: pool {label}: podOptions: {error:#}")
             })?;
+            if let Some(resources) = &pool.build_resources {
+                BuildCapacityProfile {
+                    name: label.clone(),
+                    worker_id: Uuid::nil(),
+                    capabilities: CapacityCapabilities {
+                        build: true,
+                        ..Default::default()
+                    },
+                    resources: resources.for_pool(pool),
+                }
+                .validate()
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "connection {connection}: pool {label}: buildResources: {error:#}"
+                    )
+                })?;
+            }
         }
 
         Ok(self)
@@ -438,5 +606,149 @@ mod tests {
             r#""system":"x86_64-linux","maxJobs":0"#,
         );
         assert!(error_of(&connection("a", &zero)).contains("maxJobs must be greater than zero"));
+    }
+
+    fn preview_connection() -> serde_json::Value {
+        let mut entry: serde_json::Value =
+            serde_json::from_str(&connection("a", KUBERNETES)).unwrap();
+        entry["buildScaling"] = serde_json::json!({
+            "mode": "preview", "profiles": ["x86"], "fallbackRamMb": 2048
+        });
+        entry["kubernetes"]["pools"]["x86"]["buildResources"] = serde_json::json!({
+            "cpuCount": 4, "ramTotalMb": 8192, "cpuCoreScore": 4000
+        });
+        entry
+    }
+
+    #[test]
+    fn build_preview_is_opt_in_and_preserves_policy_defaults() {
+        for launcher in [GITHUB, KUBERNETES] {
+            let config = Config::parse(&with_connections(&connection("a", launcher))).unwrap();
+            assert!(config.connections[0].build_scaling.is_none());
+        }
+        let mut entry = preview_connection();
+        entry["kubernetes"]["pools"]["x86"]["cpu"] = "3500m".into();
+        entry["kubernetes"]["pools"]["x86"]["memory"] = "8Gi".into();
+        let config = Config::parse(&with_connections(&entry.to_string())).unwrap();
+        let conn = &config.connections[0];
+        assert!(conn.is_preview());
+        let policy = conn.build_scaling.as_ref().unwrap().policy();
+        assert_eq!(policy.queue_wait, Duration::seconds(60));
+        assert_eq!(policy.startup_grace, Duration::seconds(120));
+        assert_eq!(policy.max_new_workers, 2);
+        assert_eq!(policy.fallback_ram_mb, 2048);
+        let LauncherConfig::Kubernetes(kubernetes) = &conn.launcher else {
+            panic!()
+        };
+        assert_eq!(kubernetes.pools["x86"].cpu.as_deref(), Some("3500m"));
+        assert_eq!(kubernetes.pools["x86"].memory.as_deref(), Some("8Gi"));
+    }
+
+    #[test]
+    fn build_preview_preserves_project_scope_and_legacy_names() {
+        let id = "70000000-0000-0000-0000-000000000001";
+        for (projects, expected) in [
+            (serde_json::Value::Null, None),
+            (serde_json::json!([]), Some(vec![])),
+            (
+                serde_json::json!([id]),
+                Some(vec![Uuid::parse_str(id).unwrap()]),
+            ),
+        ] {
+            let mut entry = preview_connection();
+            entry["projects"] = projects;
+            let config = Config::parse(&with_connections(&entry.to_string())).unwrap();
+            assert_eq!(config.connections[0].capacity_projects().unwrap(), expected);
+        }
+        let mut entry = preview_connection();
+        entry["projects"] = serde_json::json!(["website"]);
+        assert!(error_of(&entry.to_string()).contains("project IDs"));
+        entry["buildScaling"] = serde_json::Value::Null;
+        assert!(Config::parse(&with_connections(&entry.to_string())).is_ok());
+    }
+
+    #[test]
+    fn build_preview_rejects_invalid_settings() {
+        for (pointer, value, message) in [
+            (
+                "/buildScaling/mode",
+                serde_json::json!("active"),
+                "unknown variant",
+            ),
+            (
+                "/buildScaling/profiles",
+                serde_json::json!([]),
+                "profile alternatives",
+            ),
+            (
+                "/buildScaling/profiles",
+                serde_json::json!(["x86", "x86"]),
+                "duplicate",
+            ),
+            (
+                "/buildScaling/profiles",
+                serde_json::json!(["missing"]),
+                "not configured",
+            ),
+            (
+                "/buildScaling/maxNewWorkers",
+                serde_json::json!(17),
+                "profile alternatives",
+            ),
+            (
+                "/buildScaling/startupGrace",
+                serde_json::json!(0),
+                "positive startupGrace",
+            ),
+            (
+                "/buildScaling/fallbackRamMb",
+                serde_json::json!(0),
+                "fallbackRamMb",
+            ),
+            (
+                "/kubernetes/pools/x86/buildResources",
+                serde_json::Value::Null,
+                "explicit buildResources",
+            ),
+            (
+                "/kubernetes/pools/x86/buildResources/cpuCount",
+                serde_json::json!(0),
+                "CPU capacity",
+            ),
+            (
+                "/kubernetes/pools/x86/buildResources/ramTotalMb",
+                serde_json::json!(0),
+                "RAM budget",
+            ),
+        ] {
+            let mut entry = preview_connection();
+            let (parent, field) = pointer.rsplit_once('/').unwrap();
+            entry.pointer_mut(parent).unwrap()[field] = value;
+            assert!(error_of(&entry.to_string()).contains(message), "{pointer}");
+        }
+        let mut entry = preview_connection();
+        entry["workerCapabilities"] = serde_json::json!({"build": false});
+        assert!(error_of(&entry.to_string()).contains("build permission"));
+        entry = preview_connection();
+        entry.as_object_mut().unwrap().remove("kubernetes");
+        entry["githubActions"] =
+            serde_json::json!({"tokenFile": "/g", "repository": "acme/runners"});
+        assert!(error_of(&entry.to_string()).contains("requires Kubernetes"));
+    }
+
+    #[test]
+    fn build_preview_allows_zero_growth_and_rejects_unknown_fields() {
+        let mut entry = preview_connection();
+        entry["buildScaling"]["maxNewWorkers"] = serde_json::json!(0);
+        entry["buildScaling"]["queueWait"] = serde_json::json!(0);
+        assert!(Config::parse(&with_connections(&entry.to_string())).is_ok());
+        entry["buildScaling"]["startupTimeout"] = serde_json::json!(30);
+        assert!(error_of(&entry.to_string()).contains("unknown field"));
+        entry["buildScaling"]
+            .as_object_mut()
+            .unwrap()
+            .remove("startupTimeout");
+        entry["kubernetes"]["pools"]["x86"]["buildResources"]["memory"] = serde_json::json!("8Gi");
+        assert!(error_of(&entry.to_string()).contains("unknown field"));
     }
 }

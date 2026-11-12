@@ -88,6 +88,32 @@ let
         description = "Memory request and limit of each pod, in Kubernetes quantity notation.";
       };
 
+      buildResources = mkOption {
+        type = types.nullOr (types.submodule {
+          options = {
+            cpuCount = mkOption {
+              type = types.ints.positive;
+              description = "Assumed CPU count for build capacity assessments.";
+            };
+            ramTotalMb = mkOption {
+              type = types.ints.positive;
+              description = "Assumed usable build RAM budget in MB, excluding worker overhead.";
+            };
+            cpuCoreScore = mkOption {
+              type = types.ints.unsigned;
+              description = "Assumed per-core performance score for build capacity assessments.";
+            };
+            buildCores = mkOption {
+              type = types.nullOr types.ints.unsigned;
+              default = null;
+              description = "Assumed build core setting; null uses Gradient's automatic selection.";
+            };
+          };
+        });
+        default = null;
+        description = "Planning assumptions for preview, independent of Kubernetes quantities and measured worker resources.";
+      };
+
       nodeSelector = mkOption {
         type = types.attrsOf types.str;
         default = { };
@@ -236,7 +262,7 @@ let
         example = [ "website" "backend" ];
         description = ''
           Names or IDs of the granting projects whose waiting jobs may start workers.
-          `null` counts every project granting the team its workers.
+          `null` counts every project granting the team its workers; preview requires IDs.
         '';
       };
 
@@ -307,6 +333,42 @@ let
         default = null;
         description = "Starts the workers as Kubernetes pods. Set either this or {option}`${option "githubActions"}`.";
       };
+
+      buildScaling = mkOption {
+        type = types.nullOr (types.submodule {
+          options = {
+            mode = mkOption {
+              type = types.enum [ "preview" ];
+              description = "Reports build capacity plans without worker, webhook or Kubernetes changes.";
+            };
+            profiles = mkOption {
+              type = types.listOf types.str;
+              description = "Kubernetes pool names in preference order; each needs buildResources.";
+            };
+            queueWait = mkOption {
+              type = types.ints.unsigned;
+              default = 60;
+              description = "Seconds of ready queue waiting tolerated when an eligible worker exists.";
+            };
+            startupGrace = mkOption {
+              type = types.ints.positive;
+              default = 120;
+              description = "Startup deadline in seconds for prospective plans; stored launches keep their original deadline.";
+            };
+            maxNewWorkers = mkOption {
+              type = types.ints.unsigned;
+              default = 2;
+              description = "Maximum proposed workers per assessment; profiles times max(1, maxNewWorkers) must not exceed 16.";
+            };
+            fallbackRamMb = mkOption {
+              type = types.ints.positive;
+              description = "RAM budget in MB reserved for builds without a usable memory estimate.";
+            };
+          };
+        });
+        default = null;
+        description = "Opt-in ordinary-build capacity preview; null retains legacy capability scaling.";
+      };
     };
   };
 
@@ -318,7 +380,10 @@ let
       };
     } else {
       kubernetes = {
-        inherit (connection.kubernetes) apiServer caFile namespace image imagePullSecrets pools;
+        inherit (connection.kubernetes) apiServer caFile namespace image imagePullSecrets;
+        pools = lib.mapAttrs (_: pool:
+          if pool.buildResources == null then lib.removeAttrs pool [ "buildResources" ] else pool
+        ) connection.kubernetes.pools;
         tokenFile = "${credentialsDir}/${name}-kubernetes-token";
       };
     };
@@ -332,6 +397,8 @@ let
         gradientUrl team projects maxLaunches maxLaunchesPerKind
         workerSubstituters workerTrustedPublicKeys workerCapabilities idleTimeout maxLifetime;
       apiKeyFile = "${credentialsDir}/${name}-api-key";
+    } // lib.optionalAttrs (connection.buildScaling != null) {
+      inherit (connection) buildScaling;
     } // launcherConfig name connection) cfg.connections;
   };
 

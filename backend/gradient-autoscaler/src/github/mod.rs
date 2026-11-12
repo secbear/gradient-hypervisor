@@ -37,6 +37,9 @@ impl GitHubLauncher {
     }
 
     pub async fn setup(&self, svc: &ConnectionService) -> Option<Vec<Kind>> {
+        if svc.conn.is_preview() {
+            return None;
+        }
         setup::setup(svc, self).await
     }
 
@@ -45,6 +48,7 @@ impl GitHubLauncher {
         svc: &Arc<ConnectionService>,
         kinds: &[&Kind],
     ) -> anyhow::Result<()> {
+        svc.ensure_mutations_allowed()?;
         let branch = self.client.repository_info().await?.default_branch;
         let worker_flake = self.worker_flake(svc).await?;
         for kind in kinds {

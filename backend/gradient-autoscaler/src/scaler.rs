@@ -6,6 +6,25 @@ use crate::state::Launch;
 use std::sync::Arc;
 
 pub async fn scale(svc: &Arc<ConnectionService>) -> anyhow::Result<()> {
+    if svc.conn.is_preview() {
+        let preview = crate::build_preview::preview_build_capacity(svc).await?;
+        let pools = preview
+            .plan
+            .proposed_workers
+            .iter()
+            .map(|worker| worker.label.as_str())
+            .collect::<Vec<_>>();
+        tracing::info!(
+            connection = %svc.conn.name, captured_at = %preview.captured_at,
+            ready = preview.total_ready_builds, assessed = preview.assessed_builds,
+            ?pools, deferred = preview.plan.deferred_builds.len(),
+            starting = preview.plan.credited_starting_workers.len(),
+            draining = preview.plan.server_draining, truncated = preview.plan.builds_truncated,
+            "build capacity preview; no worker changes"
+        );
+        tracing::debug!(connection = %svc.conn.name, plan = ?preview.plan, "build capacity preview details");
+        return Ok(());
+    }
     let conn = &svc.conn;
     let demand = svc
         .gradient

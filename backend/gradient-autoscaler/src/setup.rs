@@ -5,6 +5,9 @@ const HOOK_NAME: &str = "gradient-autoscaler";
 const GRADIENT_EVENTS: [&str; 1] = ["worker.demand"];
 
 pub async fn setup(svc: &ConnectionService) {
+    if svc.conn.is_preview() {
+        return;
+    }
     report(
         svc,
         "Gradient team webhook",

@@ -208,7 +208,8 @@ pub fn plan_build_capacity(
     let mut starting = capacity
         .tracked_workers
         .iter()
-        .map(|worker| {
+        .enumerate()
+        .map(|(tracked, worker)| {
             let launch = context
                 .open
                 .iter()
@@ -220,7 +221,8 @@ pub fn plan_build_capacity(
                     && launch.registration_started
                     && age >= Duration::ZERO
                     && launch.build_intent.as_ref().is_some_and(|intent| {
-                        intent.profile == worker.profile && context.now < intent.startup_deadline
+                        intent.profile == request.tracked_profiles[tracked].profile
+                            && context.now < intent.startup_deadline
                     })
             });
             Budget {
@@ -314,10 +316,7 @@ pub fn plan_build_capacity(
         let mut launched = false;
         for (profile, candidate) in capacity.profiles.iter().enumerate() {
             let label = &context.candidate_labels[profile];
-            if !context.limits.allowed.contains(label)
-                || context.backoff.contains(label)
-                || worker_ids.contains(&candidate.worker_id)
-            {
+            if !context.limits.allowed.contains(label) || context.backoff.contains(label) {
                 continue;
             }
             let Some(needed) = build.profiles[profile]
@@ -335,6 +334,9 @@ pub fn plan_build_capacity(
                 continue;
             }
             fitting = true;
+            if worker_ids.contains(&candidate.worker_id) {
+                continue;
+            }
             let count = per_label.get(label.as_str()).copied().unwrap_or(0);
             if total >= context.limits.max_launches
                 || count >= context.limits.max_launches_per_kind

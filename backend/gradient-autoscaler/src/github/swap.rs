@@ -39,6 +39,9 @@ pub async fn swap(
     claims: &Claims,
     launch_id: Uuid,
 ) -> Result<SwapResponse, SwapError> {
+    if conn.is_preview() {
+        return Err(anyhow::anyhow!("worker changes are disabled in build scaling preview").into());
+    }
     if !claims.repository.eq_ignore_ascii_case(repository) {
         return Err(SwapError::WrongRepository(claims.repository.clone()));
     }

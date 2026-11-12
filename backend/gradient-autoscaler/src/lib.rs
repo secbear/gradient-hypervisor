@@ -1,4 +1,5 @@
 pub mod build_planner;
+pub mod build_preview;
 pub mod capacity;
 pub mod catch_up;
 pub mod config;

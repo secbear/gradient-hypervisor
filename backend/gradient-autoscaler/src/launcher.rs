@@ -30,6 +30,7 @@ impl Launcher {
         policy: &BuildScalingPolicy,
         now: OffsetDateTime,
     ) -> anyhow::Result<Launch> {
+        svc.ensure_mutations_allowed()?;
         match self {
             Self::Kubernetes(kubernetes) => {
                 kubernetes
@@ -47,6 +48,7 @@ impl Launcher {
         svc: &ConnectionService,
         launch_id: Uuid,
     ) -> anyhow::Result<()> {
+        svc.ensure_mutations_allowed()?;
         match self {
             Self::Kubernetes(kubernetes) => kubernetes.launch_prepared(svc, launch_id).await,
             Self::GitHub(_) => {
@@ -77,6 +79,9 @@ impl Launcher {
     }
 
     pub async fn setup(&self, svc: &ConnectionService) -> Option<Vec<Kind>> {
+        if svc.conn.is_preview() {
+            return None;
+        }
         match self {
             Launcher::GitHub(github) => github.setup(svc).await,
             Launcher::Kubernetes(kubernetes) => kubernetes.setup(svc).await,
@@ -88,6 +93,7 @@ impl Launcher {
         svc: &Arc<ConnectionService>,
         kinds: &[&Kind],
     ) -> anyhow::Result<()> {
+        svc.ensure_mutations_allowed()?;
         match self {
             Launcher::GitHub(github) => github.launch(svc, kinds).await,
             Launcher::Kubernetes(kubernetes) => kubernetes.launch(svc, kinds).await,

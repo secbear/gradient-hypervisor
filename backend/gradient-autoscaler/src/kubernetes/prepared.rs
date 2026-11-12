@@ -226,6 +226,7 @@ impl KubernetesLauncher {
         policy: &BuildScalingPolicy,
         now: OffsetDateTime,
     ) -> anyhow::Result<Launch> {
+        svc.ensure_mutations_allowed()?;
         ensure!(
             planned.worker_id == profile.worker_id,
             "planned worker identity differs from profile"
@@ -306,6 +307,7 @@ impl KubernetesLauncher {
         svc: &ConnectionService,
         launch_id: Uuid,
     ) -> anyhow::Result<()> {
+        svc.ensure_mutations_allowed()?;
         let launch = svc
             .state
             .launch(&svc.conn.name, launch_id)

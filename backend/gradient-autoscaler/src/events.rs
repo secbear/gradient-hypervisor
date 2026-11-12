@@ -13,11 +13,13 @@ pub async fn advance(
     launch: &Launch,
     to: LaunchState,
 ) -> anyhow::Result<()> {
+    svc.ensure_mutations_allowed()?;
     svc.state.advance_launch(launch.id, to).await?;
     Ok(())
 }
 
 pub async fn finish_launch(svc: &ConnectionService, launch: &Launch) -> anyhow::Result<()> {
+    svc.ensure_mutations_allowed()?;
     let Some(launch) = svc.state.launch(&svc.conn.name, launch.id).await? else {
         return Ok(());
     };
@@ -44,6 +46,7 @@ pub async fn finish_launch(svc: &ConnectionService, launch: &Launch) -> anyhow::
 }
 
 pub async fn delete_worker(svc: &ConnectionService, launch: &Launch) -> anyhow::Result<()> {
+    svc.ensure_mutations_allowed()?;
     let Some(worker_id) = launch.worker_id else {
         return Ok(());
     };
@@ -75,6 +78,9 @@ pub async fn learn_profile(svc: &ConnectionService, launch_id: Uuid) {
 }
 
 pub async fn record_connected_workers(svc: &ConnectionService) -> anyhow::Result<()> {
+    if svc.conn.is_preview() {
+        return Ok(());
+    }
     let waiting: Vec<Launch> = svc
         .state
         .open_launches(&svc.conn.name)

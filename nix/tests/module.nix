@@ -44,6 +44,32 @@ let
               };
             };
           };
+          connections.preview = {
+            gradientUrl = "https://gradient.example.com";
+            team = "platform";
+            apiKeyFile = "/run/secrets/gradient-api-key";
+            projects = [ ];
+            buildScaling = {
+              mode = "preview";
+              profiles = [ "x86" ];
+              fallbackRamMb = 2048;
+            };
+            kubernetes = {
+              tokenFile = "/run/secrets/kubernetes-token";
+              namespace = "gradient-workers";
+              image = "registry.example.com/gradient-worker:2.0.1";
+              pools.x86 = {
+                system = "x86_64-linux";
+                cpu = "3500m";
+                memory = "8Gi";
+                buildResources = {
+                  cpuCount = 4;
+                  ramTotalMb = 7000;
+                  cpuCoreScore = 4000;
+                };
+              };
+            };
+          };
         };
       }
     ];
@@ -52,9 +78,24 @@ let
 in
 runCommand "gradient-autoscaler-module" { nativeBuildInputs = [ jq ]; } ''
   jq -e '
-    .connections[0].kubernetes.pools.x86.podOptions |
+    .connections[] | select(.name == "platform") |
+    has("buildScaling") == false and
+    (.kubernetes.pools.x86 |
+    has("buildResources") == false and
+    (.podOptions |
     .volumes[0].secret.secretName == "worker-credentials" and
     .volumeMounts[0].readOnly == true and
-    .env[0].valueFrom.fieldRef.fieldPath == "spec.nodeName"
+    .env[0].valueFrom.fieldRef.fieldPath == "spec.nodeName"))
+  ' ${configFile} >$out
+  jq -e '
+    .connections[] | select(.name == "preview") |
+    .projects == [] and
+    .buildScaling == {
+      "mode": "preview", "profiles": ["x86"], "queueWait": 60,
+      "startupGrace": 120, "maxNewWorkers": 2, "fallbackRamMb": 2048
+    } and
+    (.kubernetes.pools.x86 |
+      .cpu == "3500m" and .memory == "8Gi" and
+      .buildResources == {"cpuCount": 4, "ramTotalMb": 7000, "cpuCoreScore": 4000, "buildCores": null})
   ' ${configFile} >$out
 ''

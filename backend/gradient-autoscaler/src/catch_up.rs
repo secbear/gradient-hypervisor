@@ -26,12 +26,16 @@ pub async fn run_connection(svc: Arc<ConnectionService>, interval: Duration) {
 }
 
 pub async fn catch_up(svc: &Arc<ConnectionService>) {
-    setup(svc).await;
+    if !svc.conn.is_preview() {
+        setup(svc).await;
+    }
     reconcile_and_scale(svc).await;
 }
 
 async fn reconcile_and_scale(svc: &Arc<ConnectionService>) {
-    if let Err(error) = reconcile(svc).await {
+    if !svc.conn.is_preview()
+        && let Err(error) = reconcile(svc).await
+    {
         tracing::warn!(connection = %svc.conn.name, "reconciling launches: {error:#}");
     }
 

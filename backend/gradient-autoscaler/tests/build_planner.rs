@@ -280,6 +280,7 @@ fn a_selected_profile_adds_one_budget_and_retains_the_assessed_uuid() {
         case.request.profiles[0].profile.worker_id
     );
     assert_eq!(plan.deferred_builds.len(), 1);
+    assert_eq!(plan.deferred_builds[0].reason, BuildWaitReason::LaunchLimit);
 }
 
 #[test]

@@ -54,6 +54,7 @@ pub fn connection(name: &str, gradient_url: &str, launcher: LauncherConfig) -> C
         idle_timeout: 120,
         max_lifetime: 21600,
         launcher,
+        build_scaling: None,
     }
 }
 

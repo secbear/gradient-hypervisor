@@ -22,6 +22,14 @@ Starts temporary Gradient team workers when connected workers cannot handle wait
 - Builds get the Nix sandbox and `/dev/kvm` when pods run with `privileged`.
 - Nix can fall back to unsandboxed builds when a pod can't create namespaces. Most clusters forbid that setup unless pods run with `privileged`.
 
+### Build Capacity Preview
+
+Set a Kubernetes connection's `buildScaling` to `{"mode":"preview","profiles":["x86"],"fallbackRamMb":2048}` to report ordinary-build capacity plans from Gradient's capacity assessment API. Preview replaces legacy scaling for that connection: it does not register workers, create or delete Pods or Secrets, repair webhooks, or reconcile launches. Other connections retain their configured behavior.
+
+Each selected pool needs `buildResources`, for example `{"cpuCount":4,"ramTotalMb":7000,"cpuCoreScore":4000,"buildCores":null}`. These are planning assumptions, not measured resources or conversions of Kubernetes `cpu` and `memory` quantities. `ramTotalMb` excludes worker overhead.
+
+`queueWait` defaults to 60 seconds, `startupGrace` to 120 seconds, and `maxNewWorkers` to 2. Plans retain the existing total and per-pool launch limits and failure backoff. The number of profiles times `max(1, maxNewWorkers)` must not exceed 16. Scoped `projects` must contain IDs; `null` means all granting projects and `[]` means none. A server without the assessment API produces an error, not a legacy scaling fallback. Preview uses the existing catch-up interval; it does not install a demand webhook.
+
 ### GitHub Actions
 
 - The service creates or repairs the Gradient team webhook, the GitHub repository webhook and `.github/workflows/gradient-worker.yml` on the default branch.

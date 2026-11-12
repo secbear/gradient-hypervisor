@@ -56,6 +56,9 @@ impl KubernetesLauncher {
     }
 
     pub async fn setup(&self, svc: &ConnectionService) -> Option<Vec<Kind>> {
+        if svc.conn.is_preview() {
+            return None;
+        }
         report(
             svc,
             "cleanup of leftover worker pods",
@@ -70,6 +73,7 @@ impl KubernetesLauncher {
         svc: &Arc<ConnectionService>,
         kinds: &[&Kind],
     ) -> anyhow::Result<()> {
+        svc.ensure_mutations_allowed()?;
         for kind in kinds {
             match self.start_pod(svc, kind).await {
                 Ok(launch_id) => {
