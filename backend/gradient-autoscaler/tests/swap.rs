@@ -24,6 +24,10 @@ struct Fixture {
 }
 
 async fn fixture() -> Fixture {
+    fixture_with_worker(None).await
+}
+
+async fn fixture_with_worker(worker_id: Option<Uuid>) -> Fixture {
     let issuer = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/.well-known/openid-configuration"))
@@ -51,7 +55,10 @@ async fn fixture() -> Fixture {
         .await;
 
     let state = State::memory().await.unwrap();
-    let launch = Launch::new("ops", "4242", "ubuntu-latest");
+    let launch = Launch {
+        worker_id,
+        ..Launch::new("ops", "4242", "ubuntu-latest")
+    };
     state.insert_launch(&launch).await.unwrap();
     Fixture {
         issuer,
@@ -59,6 +66,26 @@ async fn fixture() -> Fixture {
         state,
         launch,
     }
+}
+
+#[tokio::test]
+async fn preassigned_worker_identity_is_preserved_during_swap() {
+    let worker_id = Uuid::new_v4();
+    let fixture = fixture_with_worker(Some(worker_id)).await;
+    fixture
+        .swap_as("acme/runners", &fixture.valid_token())
+        .await
+        .unwrap();
+    let stored = fixture
+        .state
+        .launch("ops", fixture.launch.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.worker_id, Some(worker_id));
+    let registration = &fixture.gradient.received_requests().await.unwrap()[0];
+    let body: Value = serde_json::from_slice(&registration.body).unwrap();
+    assert_eq!(body["worker_id"], worker_id.to_string());
 }
 
 fn github_connection(gradient_url: &str) -> Connection {

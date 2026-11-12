@@ -26,6 +26,11 @@ pub async fn finish_launch(svc: &ConnectionService, launch: &Launch) -> anyhow::
         return Ok(());
     }
 
+    anyhow::ensure!(
+        launch.build_intent.is_none(),
+        "prepared launch requires scoped lifecycle reconciliation"
+    );
+
     delete_worker(svc, &launch).await?;
     svc.launcher.clean_up(&launch).await?;
     let outcome = if launch.state == LaunchState::Connected {
@@ -95,13 +100,19 @@ pub async fn record_connected_workers(svc: &ConnectionService) -> anyhow::Result
                 max_jobs: live.max_concurrent_builds,
                 ram_mb: live.ram_total_mb,
             };
-            svc.state
-                .put_profile(&svc.conn.name, &launch.label, &profile)
-                .await?;
+            if launch.build_intent.is_none() {
+                svc.state
+                    .put_profile(&svc.conn.name, &launch.label, &profile)
+                    .await?;
+            }
             svc.state
                 .advance_launch(launch.id, LaunchState::Connected)
                 .await?;
-            tracing::info!(connection = %svc.conn.name, label = %launch.label, ?profile, "worker connected; profile learned");
+            if launch.build_intent.is_none() {
+                tracing::info!(connection = %svc.conn.name, label = %launch.label, ?profile, "worker connected; profile learned");
+            } else {
+                tracing::info!(connection = %svc.conn.name, launch_id = %launch.id, "prepared worker connected");
+            }
         }
     }
 

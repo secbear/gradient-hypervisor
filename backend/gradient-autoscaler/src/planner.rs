@@ -128,6 +128,7 @@ impl<'a> Planner<'a> {
     fn cover_build(&mut self, system: &str, features: &[String]) {
         let covering_open = (0..self.open.len()).find(|&i| {
             !self.used[i]
+                && self.open[i].build_intent.is_none()
                 && self
                     .kind(&self.open[i].label)
                     .and_then(|kind| kind.profile.as_ref())
@@ -158,7 +159,7 @@ impl<'a> Planner<'a> {
             if let Some(i) = self
                 .open
                 .iter()
-                .position(|launch| launch.label == kind.label)
+                .position(|launch| launch.build_intent.is_none() && launch.label == kind.label)
             {
                 self.used[i] = true;
                 return true;
@@ -176,9 +177,9 @@ impl<'a> Planner<'a> {
                 .is_some_and(|p| covers(p, "builtin", &[]))
         };
         // Transfers share build capacity without architecture or feature requirements.
-        if let Some(i) =
-            (0..self.open.len()).find(|&i| covers_transfer(self.kind(&self.open[i].label)))
-        {
+        if let Some(i) = (0..self.open.len()).find(|&i| {
+            self.open[i].build_intent.is_none() && covers_transfer(self.kind(&self.open[i].label))
+        }) {
             self.used[i] = true;
             return;
         }
@@ -198,8 +199,9 @@ impl<'a> Planner<'a> {
             kind.and_then(|k| k.profile.as_ref())
                 .is_some_and(|p| p.runs_linux())
         };
-        if let Some(i) = (0..self.open.len()).find(|&i| runs_linux(self.kind(&self.open[i].label)))
-        {
+        if let Some(i) = (0..self.open.len()).find(|&i| {
+            self.open[i].build_intent.is_none() && runs_linux(self.kind(&self.open[i].label))
+        }) {
             self.used[i] = true;
             return;
         }
@@ -238,7 +240,11 @@ impl<'a> Planner<'a> {
 
     fn cancel_unneeded(&mut self) {
         for (launch, used) in self.open.iter().zip(&self.used) {
-            if !used && !launch.swapped && launch.state.is_waiting_for_runner() {
+            if !used
+                && launch.build_intent.is_none()
+                && !launch.swapped
+                && launch.state.is_waiting_for_runner()
+            {
                 self.plan.cancel.push(launch.id);
             }
         }
@@ -248,8 +254,10 @@ impl<'a> Planner<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capacity::{BuildCapacityProfile, BuilderResources, CapacityCapabilities};
     use crate::github::kinds::standard_kinds;
     use crate::gradient::UnmetRequirement;
+    use crate::state::BuildLaunchIntent;
     use crate::state::LaunchState;
 
     fn limits() -> Limits {
@@ -287,6 +295,75 @@ mod tests {
 
     fn no_backoff() -> HashSet<String> {
         HashSet::new()
+    }
+
+    #[test]
+    fn prepared_launches_occupy_limits_but_are_not_legacy_supply_or_cancellation_targets() {
+        let worker_id = uuid::Uuid::new_v4();
+        let mut launch = open("ubuntu-latest", 1, LaunchState::Queued);
+        launch.worker_id = Some(worker_id);
+        launch.build_intent = Some(BuildLaunchIntent {
+            profile: BuildCapacityProfile {
+                name: "prepared".into(),
+                worker_id,
+                capabilities: CapacityCapabilities {
+                    build: true,
+                    ..Default::default()
+                },
+                resources: BuilderResources {
+                    architectures: vec!["x86_64-linux".into()],
+                    system_features: vec![],
+                    max_concurrent_builds: 1,
+                    cpu_count: 1,
+                    cpu_core_score: 4_000,
+                    ram_total_mb: 1_000,
+                    build_cores: None,
+                },
+            },
+            startup_deadline: launch.dispatched_at + time::Duration::minutes(2),
+            kubernetes: None,
+        });
+        for demand in [
+            builds(&[("x86_64-linux", &[])]),
+            TeamDemand {
+                network: 1,
+                ..Default::default()
+            },
+        ] {
+            let planned = plan(
+                &demand,
+                std::slice::from_ref(&launch),
+                &standard_kinds(),
+                &limits(),
+                &no_backoff(),
+            );
+            assert_eq!(planned.launch, ["ubuntu-latest"]);
+            assert!(planned.cancel.is_empty());
+            let mut capped = limits();
+            capped.max_launches = 1;
+            assert!(
+                plan(
+                    &demand,
+                    std::slice::from_ref(&launch),
+                    &standard_kinds(),
+                    &capped,
+                    &no_backoff()
+                )
+                .launch
+                .is_empty()
+            );
+        }
+        assert!(
+            plan(
+                &TeamDemand::default(),
+                &[launch],
+                &standard_kinds(),
+                &limits(),
+                &no_backoff()
+            )
+            .cancel
+            .is_empty()
+        );
     }
 
     #[test]

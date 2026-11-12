@@ -46,6 +46,9 @@ async fn reconcile(svc: &ConnectionService) -> anyhow::Result<()> {
     }
 
     for launch in svc.state.open_launches(&svc.conn.name).await? {
+        if launch.build_intent.is_some() {
+            continue;
+        }
         let progress = match svc.launcher.progress(&launch).await {
             Ok(progress) => progress,
             Err(error) => {

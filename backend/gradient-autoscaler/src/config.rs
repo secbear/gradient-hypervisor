@@ -71,6 +71,20 @@ impl Default for WorkerCapabilities {
     }
 }
 
+impl WorkerCapabilities {
+    pub fn permits(self, requested: Self) -> bool {
+        [
+            (self.build, requested.build),
+            (self.network, requested.network),
+            (self.secrets, requested.secrets),
+            (self.exec, requested.exec),
+            (self.eval, requested.eval),
+        ]
+        .into_iter()
+        .all(|(enabled, required)| enabled || !required)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GitHubActions {

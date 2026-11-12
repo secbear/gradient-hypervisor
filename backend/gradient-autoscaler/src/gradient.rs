@@ -64,6 +64,30 @@ pub struct TeamWorker {
     pub connected: bool,
     #[serde(default)]
     pub live: Option<WorkerLive>,
+    pub active: Option<bool>,
+    pub managed: Option<bool>,
+    pub gradient_ci: Option<bool>,
+    pub url: Option<String>,
+    pub enable_build: Option<bool>,
+    pub enable_network: Option<bool>,
+    pub enable_secrets: Option<bool>,
+    pub enable_exec: Option<bool>,
+    pub enable_eval: Option<bool>,
+}
+
+impl TeamWorker {
+    pub fn registration_matches(&self, display_name: &str, caps: WorkerCapabilities) -> bool {
+        self.display_name == display_name
+            && self.active == Some(true)
+            && self.managed == Some(false)
+            && self.gradient_ci == Some(false)
+            && self.url.is_none()
+            && self.enable_build == Some(caps.build)
+            && self.enable_network == Some(caps.network)
+            && self.enable_secrets == Some(caps.secrets)
+            && self.enable_exec == Some(caps.exec)
+            && self.enable_eval == Some(caps.eval)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -100,6 +124,11 @@ struct ServerConfig {
 }
 
 #[derive(Deserialize)]
+struct TeamIdentity {
+    id: Uuid,
+}
+
+#[derive(Deserialize)]
 struct RegisteredTeamWorker {
     team: Uuid,
     token: Option<String>,
@@ -111,6 +140,8 @@ struct RegisterTeamWorkerRequest<'a> {
     display_name: &'a str,
     #[serde(flatten)]
     capabilities: WorkerCapabilities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -178,6 +209,13 @@ impl GradientClient {
             .await
     }
 
+    pub async fn team_id(&self, team: &str) -> anyhow::Result<Uuid> {
+        let identity: TeamIdentity = self
+            .message(self.request(Method::GET, &format!("/api/v1/teams/{team}")))
+            .await?;
+        Ok(identity.id)
+    }
+
     pub async fn capacity_assessment(
         &self,
         team: &str,
@@ -223,6 +261,7 @@ impl GradientClient {
                 worker_id,
                 display_name,
                 capabilities,
+                token: None,
             });
         let registered: RegisteredTeamWorker = self.message(request).await?;
         let token = registered.token.ok_or_else(|| {
@@ -232,6 +271,28 @@ impl GradientClient {
             team: registered.team,
             token,
         })
+    }
+
+    pub async fn register_team_worker_with_token(
+        &self,
+        team: &str,
+        worker_id: Uuid,
+        display_name: &str,
+        capabilities: WorkerCapabilities,
+        token: &str,
+    ) -> anyhow::Result<Uuid> {
+        let registered: RegisteredTeamWorker = self
+            .message(
+                self.request(Method::POST, &format!("/api/v1/teams/{team}/workers"))
+                    .json(&RegisterTeamWorkerRequest {
+                        worker_id,
+                        display_name,
+                        capabilities,
+                        token: Some(token),
+                    }),
+            )
+            .await?;
+        Ok(registered.team)
     }
 
     pub async fn delete_team_worker(&self, team: &str, worker_id: Uuid) -> anyhow::Result<()> {

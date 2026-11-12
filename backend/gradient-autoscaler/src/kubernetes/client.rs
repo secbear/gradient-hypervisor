@@ -1,6 +1,7 @@
 use crate::config::Kubernetes;
 use crate::rest::{http_client, http_client_trusting, send, status_of};
 use anyhow::Context;
+use k8s_openapi::api::core::v1::{PodSpec, Secret};
 use reqwest::{Client, Method, RequestBuilder, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
@@ -23,6 +24,8 @@ pub struct Pod {
     pub metadata: ObjectMeta,
     #[serde(default)]
     pub status: Option<PodStatus>,
+    #[serde(default)]
+    pub spec: Option<PodSpec>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -67,6 +70,14 @@ struct PodList {
 }
 
 impl KubernetesClient {
+    pub fn api_url(&self) -> &Url {
+        &self.api
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
     pub fn new(config: &Kubernetes) -> anyhow::Result<KubernetesClient> {
         let (api, ca_file) = match &config.api_server {
             Some(api) => (api.clone(), config.ca_file.clone()),
@@ -126,6 +137,28 @@ impl KubernetesClient {
 
     pub async fn create_secret(&self, secret: &Value) -> anyhow::Result<()> {
         let request = self.request(Method::POST, "secrets")?.json(secret);
+        send(&self.http, request).await?;
+        Ok(())
+    }
+
+    pub async fn secret(&self, name: &str) -> anyhow::Result<Option<Secret>> {
+        let request = self.request(Method::GET, &format!("secrets/{name}"))?;
+        match send(&self.http, request).await {
+            Ok(response) => Ok(Some(response.json().await?)),
+            Err(error) if status_of(&error) == Some(StatusCode::NOT_FOUND) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn update_secret(&self, secret: &Secret) -> anyhow::Result<()> {
+        let name = secret
+            .metadata
+            .name
+            .as_deref()
+            .context("secret has no name")?;
+        let request = self
+            .request(Method::PUT, &format!("secrets/{name}"))?
+            .json(secret);
         send(&self.http, request).await?;
         Ok(())
     }

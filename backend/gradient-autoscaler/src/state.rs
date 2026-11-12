@@ -1,5 +1,8 @@
+use crate::capacity::BuildCapacityProfile;
 use crate::kinds::Profile;
-use anyhow::{Context, bail};
+use crate::kubernetes::KubernetesLaunchSpec;
+use anyhow::{Context, bail, ensure};
+use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
 use std::path::Path;
@@ -31,6 +34,38 @@ pub struct Launch {
     pub worker_id: Option<Uuid>,
     pub swapped: bool,
     pub dispatched_at: OffsetDateTime,
+    pub build_intent: Option<BuildLaunchIntent>,
+    pub registration_started: bool,
+    pub secret_uid: Option<String>,
+    pub pod_uid: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildLaunchIntent {
+    pub profile: BuildCapacityProfile,
+    #[serde(with = "time::serde::rfc3339")]
+    pub startup_deadline: OffsetDateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubernetes: Option<KubernetesLaunchSpec>,
+}
+
+impl BuildLaunchIntent {
+    fn validate(&self, launch: &Launch) -> anyhow::Result<()> {
+        self.profile.validate()?;
+        ensure!(
+            launch.worker_id == Some(self.profile.worker_id),
+            "build launch identity differs from its assessed profile"
+        );
+        ensure!(
+            self.startup_deadline > launch.dispatched_at,
+            "build launch startup deadline must follow dispatch"
+        );
+        if let Some(spec) = &self.kubernetes {
+            spec.validate(launch, &self.profile)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -107,12 +142,17 @@ impl Launch {
             worker_id: None,
             swapped: false,
             dispatched_at: OffsetDateTime::now_utc(),
+            build_intent: None,
+            registration_started: false,
+            secret_uid: None,
+            pod_uid: None,
         }
     }
 
     fn from_row(row: &SqliteRow) -> anyhow::Result<Launch> {
         let worker_id: Option<String> = row.try_get("worker_id")?;
-        Ok(Launch {
+        let raw: Option<String> = row.try_get("build_intent")?;
+        let launch = Launch {
             id: row.try_get::<String, _>("id")?.parse()?,
             connection: row.try_get("connection")?,
             external_id: row.try_get("external_id")?,
@@ -121,7 +161,15 @@ impl Launch {
             worker_id: worker_id.map(|id| id.parse()).transpose()?,
             swapped: row.try_get("swapped")?,
             dispatched_at: OffsetDateTime::from_unix_timestamp(row.try_get("dispatched_at")?)?,
-        })
+            build_intent: raw.map(|raw| serde_json::from_str(&raw)).transpose()?,
+            registration_started: row.try_get("registration_started")?,
+            secret_uid: row.try_get("secret_uid")?,
+            pod_uid: row.try_get("pod_uid")?,
+        };
+        if let Some(intent) = &launch.build_intent {
+            intent.validate(&launch)?;
+        }
+        Ok(launch)
     }
 }
 
@@ -156,9 +204,12 @@ impl State {
     }
 
     pub async fn insert_launch(&self, launch: &Launch) -> anyhow::Result<()> {
+        if let Some(intent) = &launch.build_intent {
+            intent.validate(launch)?;
+        }
         sqlx::query(
-            "INSERT INTO launch (id, connection, external_id, label, state, worker_id, swapped, dispatched_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO launch (id, connection, external_id, label, state, worker_id, swapped, dispatched_at, updated_at, build_intent, registration_started, secret_uid, pod_uid)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(launch.id.to_string())
         .bind(&launch.connection)
@@ -169,8 +220,70 @@ impl State {
         .bind(launch.swapped)
         .bind(launch.dispatched_at.unix_timestamp())
         .bind(now())
+        .bind(launch.build_intent.as_ref().map(serde_json::to_string).transpose()?)
+        .bind(launch.registration_started)
+        .bind(&launch.secret_uid)
+        .bind(&launch.pod_uid)
         .execute(&self.0)
         .await?;
+        Ok(())
+    }
+
+    pub async fn claim_build_registration(&self, launch: &Launch) -> anyhow::Result<bool> {
+        Ok(sqlx::query(
+            "UPDATE launch SET registration_started = 1, updated_at = ?
+             WHERE id = ? AND connection = ? AND build_intent IS NOT NULL
+             AND registration_started = 0 AND state IN (?, ?, ?, ?)",
+        )
+        .bind(now())
+        .bind(launch.id.to_string())
+        .bind(&launch.connection)
+        .bind(OPEN_STATES[0].as_str())
+        .bind(OPEN_STATES[1].as_str())
+        .bind(OPEN_STATES[2].as_str())
+        .bind(OPEN_STATES[3].as_str())
+        .execute(&self.0)
+        .await?
+        .rows_affected()
+            == 1)
+    }
+
+    pub async fn bind_build_objects(
+        &self,
+        launch: &Launch,
+        secret_uid: &str,
+        pod_uid: Option<&str>,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            !secret_uid.is_empty() && pod_uid.is_none_or(|uid| !uid.is_empty()),
+            "build object UID is empty"
+        );
+        let bound = sqlx::query(
+            "UPDATE launch SET secret_uid = ?, pod_uid = coalesce(pod_uid, ?), updated_at = ?
+             WHERE id = ? AND connection = ? AND build_intent IS NOT NULL
+             AND (secret_uid IS NULL OR secret_uid = ?)
+             AND (? IS NULL OR pod_uid IS NULL OR pod_uid = ?)
+             AND state IN (?, ?, ?, ?)",
+        )
+        .bind(secret_uid)
+        .bind(pod_uid)
+        .bind(now())
+        .bind(launch.id.to_string())
+        .bind(&launch.connection)
+        .bind(secret_uid)
+        .bind(pod_uid)
+        .bind(pod_uid)
+        .bind(OPEN_STATES[0].as_str())
+        .bind(OPEN_STATES[1].as_str())
+        .bind(OPEN_STATES[2].as_str())
+        .bind(OPEN_STATES[3].as_str())
+        .execute(&self.0)
+        .await?
+        .rows_affected();
+        ensure!(
+            bound == 1,
+            "build object identity changed or launch is closed"
+        );
         Ok(())
     }
 
@@ -221,8 +334,13 @@ impl State {
 
     pub async fn claim_cancel(&self, id: Uuid) -> anyhow::Result<bool> {
         let waiting = [LaunchState::Dispatched, LaunchState::Queued];
-        self.move_launch(id, LaunchState::Cancelled, &waiting, " AND swapped = 0")
-            .await
+        self.move_launch(
+            id,
+            LaunchState::Cancelled,
+            &waiting,
+            " AND swapped = 0 AND build_intent IS NULL",
+        )
+        .await
     }
 
     async fn move_launch(
@@ -252,7 +370,13 @@ impl State {
     pub async fn mark_swapped(&self, id: Uuid, worker_id: Uuid) -> anyhow::Result<bool> {
         let result = sqlx::query(
             "UPDATE launch SET swapped = 1, worker_id = ?, updated_at = ?
-             WHERE id = ? AND swapped = 0 AND state IN (?, ?, ?, ?)",
+             WHERE id = ? AND swapped = 0 AND state IN (?, ?, ?, ?)
+             AND (build_intent IS NULL OR worker_id = ?)
+             AND NOT EXISTS (
+                SELECT 1 FROM launch reserved WHERE reserved.id != launch.id
+                AND reserved.worker_id = ?
+                AND (reserved.build_intent IS NOT NULL OR launch.build_intent IS NOT NULL)
+             )",
         )
         .bind(worker_id.to_string())
         .bind(now())
@@ -261,6 +385,8 @@ impl State {
         .bind(OPEN_STATES[1].as_str())
         .bind(OPEN_STATES[2].as_str())
         .bind(OPEN_STATES[3].as_str())
+        .bind(worker_id.to_string())
+        .bind(worker_id.to_string())
         .execute(&self.0)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -351,7 +477,201 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capacity::{BuilderResources, CapacityCapabilities};
     use time::Duration;
+
+    fn prepared_launch(connection: &str, external: &str) -> Launch {
+        let worker_id = Uuid::new_v4();
+        let mut launch = Launch {
+            worker_id: Some(worker_id),
+            ..Launch::new(connection, external, "builder")
+        };
+        launch.build_intent = Some(BuildLaunchIntent {
+            profile: BuildCapacityProfile {
+                name: "builder".into(),
+                worker_id,
+                capabilities: CapacityCapabilities {
+                    build: true,
+                    ..Default::default()
+                },
+                resources: BuilderResources {
+                    architectures: vec!["x86_64-linux".into()],
+                    system_features: vec![],
+                    max_concurrent_builds: 4,
+                    cpu_count: 4,
+                    cpu_core_score: 4_000,
+                    ram_total_mb: 16_000,
+                    build_cores: None,
+                },
+            },
+            startup_deadline: launch.dispatched_at + Duration::minutes(2),
+            kubernetes: None,
+        });
+        launch
+    }
+
+    #[tokio::test]
+    async fn build_intent_survives_restart_and_state_changes_without_renewal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite");
+        let launch = prepared_launch("a", "1");
+        let state = State::open(&path).await.unwrap();
+        state.insert_launch(&launch).await.unwrap();
+        assert!(state.claim_build_registration(&launch).await.unwrap());
+        assert!(!state.claim_build_registration(&launch).await.unwrap());
+        state
+            .bind_build_objects(&launch, "secret-a", Some("pod-a"))
+            .await
+            .unwrap();
+        state
+            .advance_launch(launch.id, LaunchState::Queued)
+            .await
+            .unwrap();
+        state.0.close().await;
+        let restored = State::open(&path).await.unwrap();
+        let saved = restored.launch("a", launch.id).await.unwrap().unwrap();
+        assert_eq!(saved.worker_id, launch.worker_id);
+        assert_eq!(saved.build_intent, launch.build_intent);
+        assert_eq!(saved.state, LaunchState::Queued);
+        assert!(saved.registration_started);
+        assert_eq!(saved.secret_uid.as_deref(), Some("secret-a"));
+        assert_eq!(saved.pod_uid.as_deref(), Some("pod-a"));
+        assert!(
+            restored
+                .bind_build_objects(&saved, "secret-b", Some("pod-a"))
+                .await
+                .is_err()
+        );
+        assert!(
+            restored
+                .bind_build_objects(&saved, "secret-a", Some("pod-b"))
+                .await
+                .is_err()
+        );
+        assert!(!restored.claim_cancel(launch.id).await.unwrap());
+        assert!(
+            !restored
+                .mark_swapped(launch.id, Uuid::new_v4())
+                .await
+                .unwrap()
+        );
+        assert!(
+            restored
+                .mark_swapped(launch.id, launch.worker_id.unwrap())
+                .await
+                .unwrap()
+        );
+        let saved = restored.launch("a", launch.id).await.unwrap().unwrap();
+        assert_eq!(saved.build_intent, launch.build_intent);
+    }
+
+    #[tokio::test]
+    async fn build_intent_rejects_identity_collision_and_mutation() {
+        let state = State::memory().await.unwrap();
+        let launch = prepared_launch("a", "1");
+        state.insert_launch(&launch).await.unwrap();
+        let duplicate = Launch {
+            id: Uuid::new_v4(),
+            connection: "b".into(),
+            external_id: "2".into(),
+            ..launch.clone()
+        };
+        assert!(state.insert_launch(&duplicate).await.is_err());
+        let legacy_collision = Launch {
+            id: Uuid::new_v4(),
+            connection: "b".into(),
+            external_id: "legacy".into(),
+            build_intent: None,
+            ..launch.clone()
+        };
+        assert!(state.insert_launch(&legacy_collision).await.is_err());
+        let legacy = Launch::new("b", "swap", "builder");
+        state.insert_launch(&legacy).await.unwrap();
+        assert!(
+            !state
+                .mark_swapped(legacy.id, launch.worker_id.unwrap())
+                .await
+                .unwrap()
+        );
+        assert!(
+            sqlx::query("UPDATE launch SET worker_id = ? WHERE id = ?")
+                .bind(launch.worker_id.unwrap().to_string())
+                .bind(legacy.id.to_string())
+                .execute(&state.0)
+                .await
+                .is_err()
+        );
+        let legacy_first = Launch {
+            worker_id: Some(Uuid::new_v4()),
+            ..Launch::new("c", "legacy-first", "builder")
+        };
+        state.insert_launch(&legacy_first).await.unwrap();
+        let mut prepared_second = prepared_launch("c", "prepared-second");
+        prepared_second.worker_id = legacy_first.worker_id;
+        prepared_second
+            .build_intent
+            .as_mut()
+            .unwrap()
+            .profile
+            .worker_id = legacy_first.worker_id.unwrap();
+        assert!(state.insert_launch(&prepared_second).await.is_err());
+        for (column, value) in [
+            ("worker_id", Uuid::new_v4().to_string()),
+            ("build_intent", "{}".into()),
+            ("label", "changed".into()),
+            ("connection", "b".into()),
+            ("external_id", "changed".into()),
+            ("dispatched_at", "1".into()),
+        ] {
+            assert!(
+                sqlx::query(&format!("UPDATE launch SET {column} = ? WHERE id = ?"))
+                    .bind(value)
+                    .bind(launch.id.to_string())
+                    .execute(&state.0)
+                    .await
+                    .is_err(),
+                "{column}"
+            );
+        }
+        assert_eq!(
+            state
+                .launch("a", launch.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .build_intent,
+            launch.build_intent
+        );
+        assert_eq!(state.open_launches("a").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn old_launch_rows_migrate_without_assumed_build_capacity() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::from_str("sqlite::memory:").unwrap())
+            .await
+            .unwrap();
+        let mut previous = sqlx::migrate!("./migrations");
+        previous.migrations = std::borrow::Cow::Owned(
+            previous
+                .iter()
+                .filter(|migration| migration.version < 3)
+                .cloned()
+                .collect(),
+        );
+        previous.run(&pool).await.unwrap();
+        let legacy = Launch::new("a", "42", "builder");
+        sqlx::query("INSERT INTO launch (id, connection, external_id, label, state, dispatched_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+            .bind(legacy.id.to_string()).bind("a").bind("42").bind("builder").bind("queued")
+            .bind(legacy.dispatched_at.unix_timestamp()).bind(now()).execute(&pool).await.unwrap();
+        let state = State::migrated(pool).await.unwrap();
+        let saved = state.launch("a", legacy.id).await.unwrap().unwrap();
+        assert_eq!(saved.state, LaunchState::Queued);
+        assert!(saved.build_intent.is_none());
+        assert!(!saved.registration_started);
+        assert!(state.claim_cancel(saved.id).await.unwrap());
+    }
 
     #[tokio::test]
     async fn mark_swapped_only_once() {

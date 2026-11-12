@@ -1,9 +1,13 @@
+use crate::build_planner::{BuildScalingPolicy, PlannedBuildWorker};
+use crate::capacity::BuildCapacityProfile;
 use crate::github::GitHubLauncher;
 use crate::kinds::Kind;
 use crate::kubernetes::KubernetesLauncher;
 use crate::service::ConnectionService;
 use crate::state::Launch;
 use std::sync::Arc;
+use time::OffsetDateTime;
+use uuid::Uuid;
 
 pub enum Launcher {
     GitHub(GitHubLauncher),
@@ -18,6 +22,39 @@ pub enum Progress {
 }
 
 impl Launcher {
+    pub async fn prepare_build_launch(
+        &self,
+        svc: &ConnectionService,
+        planned: &PlannedBuildWorker,
+        profile: &BuildCapacityProfile,
+        policy: &BuildScalingPolicy,
+        now: OffsetDateTime,
+    ) -> anyhow::Result<Launch> {
+        match self {
+            Self::Kubernetes(kubernetes) => {
+                kubernetes
+                    .prepare_build_launch(svc, planned, profile, policy, now)
+                    .await
+            }
+            Self::GitHub(_) => {
+                anyhow::bail!("prepared build launches are not supported for GitHub Actions")
+            }
+        }
+    }
+
+    pub async fn launch_prepared(
+        &self,
+        svc: &ConnectionService,
+        launch_id: Uuid,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Kubernetes(kubernetes) => kubernetes.launch_prepared(svc, launch_id).await,
+            Self::GitHub(_) => {
+                anyhow::bail!("prepared build launches are not supported for GitHub Actions")
+            }
+        }
+    }
+
     pub fn github(&self) -> Option<&GitHubLauncher> {
         match self {
             Launcher::GitHub(github) => Some(github),

@@ -1,5 +1,8 @@
 pub mod client;
 pub mod pod;
+mod prepared;
+
+pub use prepared::KubernetesLaunchSpec;
 
 use crate::config::{Kubernetes, Pool};
 use crate::events::{finish_launch, learn_profile};

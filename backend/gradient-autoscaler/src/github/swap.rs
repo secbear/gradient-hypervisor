@@ -50,19 +50,25 @@ pub async fn swap(
         .filter(|launch| launch.external_id == run_id && launch.state.is_open())
         .ok_or(SwapError::UnknownLaunch)?;
 
-    let worker_id = Uuid::new_v4();
+    let worker_id = launch.worker_id.unwrap_or_else(Uuid::new_v4);
+    let capabilities = launch
+        .build_intent
+        .as_ref()
+        .map_or(conn.worker_capabilities, |intent| {
+            intent.profile.registration_capabilities()
+        });
+    if !conn.worker_capabilities.permits(capabilities) {
+        return Err(
+            anyhow::anyhow!("prepared worker exceeds current connection permissions").into(),
+        );
+    }
     if !state.mark_swapped(launch.id, worker_id).await? {
         return Err(SwapError::AlreadySwapped);
     }
 
     let display_name = format!("gha-{}-{}", claims.run_id, claims.run_attempt);
     let registered = gradient
-        .register_team_worker_with_capabilities(
-            &conn.team,
-            worker_id,
-            &display_name,
-            conn.worker_capabilities,
-        )
+        .register_team_worker_with_capabilities(&conn.team, worker_id, &display_name, capabilities)
         .await?;
     Ok(SwapResponse {
         server_url: worker_server_url(&conn.gradient_url)?,

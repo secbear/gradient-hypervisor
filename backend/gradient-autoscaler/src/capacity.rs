@@ -1,3 +1,4 @@
+use crate::config::WorkerCapabilities;
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -227,7 +228,17 @@ impl CapacityAssessmentRequest {
 }
 
 impl BuildCapacityProfile {
-    fn validate(&self) -> anyhow::Result<()> {
+    pub(crate) fn registration_capabilities(&self) -> WorkerCapabilities {
+        WorkerCapabilities {
+            build: self.capabilities.build,
+            network: self.capabilities.network,
+            secrets: self.capabilities.secrets,
+            exec: self.capabilities.exec,
+            eval: self.capabilities.eval,
+        }
+    }
+
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
         ensure!(
             !self.name.trim().is_empty(),
             "capacity profile name is empty"

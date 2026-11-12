@@ -3,7 +3,7 @@ use gradient_autoscaler::build_planner::{
 };
 use gradient_autoscaler::capacity::*;
 use gradient_autoscaler::planner::Limits;
-use gradient_autoscaler::state::{Launch, LaunchState};
+use gradient_autoscaler::state::{BuildLaunchIntent, Launch, LaunchState};
 use std::collections::HashSet;
 use time::Duration;
 use uuid::Uuid;
@@ -163,6 +163,7 @@ impl Case {
     fn starting(&mut self, connected: bool, live_index: Option<usize>, age: Duration) {
         let profile = profile("starting", 4_000, 2);
         let worker_id = profile.profile.worker_id;
+        let saved_profile = profile.profile.clone();
         self.request.tracked_profiles.push(profile.clone());
         self.capacity.tracked_workers.push(TrackedCapacityWorker {
             profile: profile.profile,
@@ -180,6 +181,12 @@ impl Case {
         let mut launch = Launch::new("ops", "pod", "starting");
         launch.worker_id = Some(worker_id);
         launch.dispatched_at = parse_timestamp(CAPTURED).unwrap() - age;
+        launch.build_intent = Some(BuildLaunchIntent {
+            profile: saved_profile,
+            startup_deadline: launch.dispatched_at + self.policy.startup_grace,
+            kubernetes: None,
+        });
+        launch.registration_started = true;
         self.open.push(launch);
     }
 }
@@ -226,11 +233,21 @@ fn starting_capacity_preserves_the_only_specialist_budget() {
     case.starting(false, None, Duration::seconds(30));
     case.request.tracked_profiles[1].profile.name = "basic".into();
     case.capacity.tracked_workers[1].profile.name = "basic".into();
+    case.open[1].build_intent.as_mut().unwrap().profile.name = "basic".into();
     for profile in &mut case.request.tracked_profiles {
         profile.profile.resources.max_concurrent_builds = 1;
     }
     for worker in &mut case.capacity.tracked_workers {
         worker.profile.resources.max_concurrent_builds = 1;
+    }
+    for launch in &mut case.open {
+        launch
+            .build_intent
+            .as_mut()
+            .unwrap()
+            .profile
+            .resources
+            .max_concurrent_builds = 1;
     }
     case.capacity.builds[1].tracked_workers[1] = None;
     let plan = case.plan();
@@ -352,6 +369,36 @@ fn a_tracked_profile_without_a_matching_launch_earns_no_startup_credit() {
     assert_eq!(case.plan().proposed_workers.len(), 1);
     case.open.clear();
     assert_eq!(case.plan().proposed_workers.len(), 1);
+}
+
+#[test]
+fn startup_credit_requires_saved_matching_registered_intent_and_its_original_deadline() {
+    let mut case = Case::new(vec![profile("small", 4_000, 2)], 1, Some(1_000));
+    case.starting(false, None, Duration::seconds(120));
+    case.policy.startup_grace = Duration::hours(1);
+    assert!(case.plan().credited_starting_workers.is_empty());
+    case.open[0].build_intent.as_mut().unwrap().startup_deadline += Duration::minutes(1);
+    assert_eq!(case.plan().credited_starting_workers.len(), 1);
+    case.open[0]
+        .build_intent
+        .as_mut()
+        .unwrap()
+        .profile
+        .resources
+        .ram_total_mb += 1;
+    assert!(case.plan().credited_starting_workers.is_empty());
+    case.open[0]
+        .build_intent
+        .as_mut()
+        .unwrap()
+        .profile
+        .resources
+        .ram_total_mb -= 1;
+    case.open[0].registration_started = false;
+    assert!(case.plan().credited_starting_workers.is_empty());
+    case.open[0].registration_started = true;
+    case.open[0].build_intent = None;
+    assert!(case.plan().credited_starting_workers.is_empty());
 }
 
 #[test]

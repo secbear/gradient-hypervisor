@@ -217,8 +217,11 @@ pub fn plan_build_capacity(
                 let age = context.now - launch.dispatched_at;
                 !worker.connected
                     && launch.state != LaunchState::Connected
+                    && launch.registration_started
                     && age >= Duration::ZERO
-                    && age < context.policy.startup_grace
+                    && launch.build_intent.as_ref().is_some_and(|intent| {
+                        intent.profile == worker.profile && context.now < intent.startup_deadline
+                    })
             });
             Budget {
                 slots: if eligible {
