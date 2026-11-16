@@ -1,4 +1,5 @@
-use crate::config::pod_options::{PEERS_DIR, PEERS_VOLUME, STATE_DIR, STATE_VOLUME};
+use crate::capacity::BuildCapacityProfile;
+use crate::config::pod_options::{CAPACITY_ENV, PEERS_DIR, PEERS_VOLUME, STATE_DIR, STATE_VOLUME};
 use crate::config::{Kubernetes, Pool, WorkerCapabilities};
 use crate::kubernetes::client::Pod;
 use crate::launcher::Progress;
@@ -36,6 +37,21 @@ pub fn pod_name(launch_id: Uuid) -> String {
 }
 
 impl WorkerPod<'_> {
+    pub(crate) fn capacity_manifest(&self, profile: &BuildCapacityProfile) -> Value {
+        let mut manifest = self.manifest();
+        manifest["spec"]["containers"][0]["env"]
+            .as_array_mut()
+            .unwrap()
+            .extend(
+                capacity_environment(profile)
+                    .into_iter()
+                    .filter_map(|(name, value)| {
+                        value.map(|value| json!({ "name": name, "value": value }))
+                    }),
+            );
+        manifest
+    }
+
     pub fn manifest(&self) -> Value {
         let name = pod_name(self.launch_id);
         let mut manifest = json!({
@@ -175,6 +191,55 @@ pub fn peers_secret(pod: &Pod, team: Uuid, token: &str) -> Value {
     })
 }
 
+pub(crate) fn capacity_environment(
+    profile: &BuildCapacityProfile,
+) -> [(&'static str, Option<String>); 4] {
+    let resources = &profile.resources;
+    [
+        (CAPACITY_ENV[0], Some(resources.architectures.join(","))),
+        (
+            CAPACITY_ENV[1],
+            (!resources.system_features.is_empty()).then(|| resources.system_features.join(",")),
+        ),
+        (
+            CAPACITY_ENV[2],
+            (resources.cpu_core_score > 0).then(|| resources.cpu_core_score.to_string()),
+        ),
+        (
+            CAPACITY_ENV[3],
+            resources
+                .build_cores
+                .filter(|cores| *cores > 0)
+                .map(|cores| cores.to_string()),
+        ),
+    ]
+    .map(|(name, value)| (name, value.map(literal_environment_value)))
+}
+
+fn literal_environment_value(value: String) -> String {
+    // Kubernetes expands dollars in EnvVar values; profile settings are literals.
+    value.replace('$', "$$")
+}
+
+pub(crate) fn capacity_features_setting(features: &[String]) -> Option<String> {
+    (!features.is_empty()).then(|| {
+        literal_environment_value(format!("extra-system-features = {}", features.join(" ")))
+    })
+}
+
+pub(crate) fn capacity_nix_config(
+    substituters: &[String],
+    trusted_public_keys: &[String],
+    features: &[String],
+) -> Option<String> {
+    let caches = nix_config(substituters, trusted_public_keys).map(literal_environment_value);
+    let settings = caches
+        .into_iter()
+        .chain(capacity_features_setting(features))
+        .collect::<Vec<_>>();
+    (!settings.is_empty()).then(|| settings.join("\n"))
+}
+
 pub fn nix_config(substituters: &[String], trusted_public_keys: &[String]) -> Option<String> {
     if substituters.is_empty() && trusted_public_keys.is_empty() {
         return None;
@@ -237,6 +302,29 @@ mod tests {
             "privileged": true,
         }))
         .unwrap()
+    }
+
+    fn capacity_profile() -> BuildCapacityProfile {
+        BuildCapacityProfile {
+            name: "x86".into(),
+            worker_id: Uuid::new_v4(),
+            capabilities: crate::capacity::CapacityCapabilities {
+                build: true,
+                network: true,
+                secrets: true,
+                eval: true,
+                ..Default::default()
+            },
+            resources: crate::capacity::BuilderResources {
+                architectures: vec!["x86_64-linux".into()],
+                system_features: vec![],
+                max_concurrent_builds: 2,
+                cpu_count: 4,
+                ram_total_mb: 8192,
+                cpu_core_score: 0,
+                build_cores: Some(0),
+            },
+        }
     }
 
     fn worker_pod<'a>(cluster: &'a Kubernetes, pool: &'a Pool) -> WorkerPod<'a> {
@@ -340,6 +428,74 @@ mod tests {
         }
         .manifest();
         assert!(!env_of(&manifest).contains_key("NIX_CONFIG"));
+    }
+
+    #[test]
+    fn prepared_environment_retains_native_automatic_settings() {
+        let profile = capacity_profile();
+        let (cluster, mut pool) = (cluster(), pool());
+        pool.features.clear();
+        pool.max_jobs = 2;
+        let manifest = WorkerPod {
+            worker_id: profile.worker_id,
+            nix_config: capacity_nix_config(&[], &[], &[]),
+            ..worker_pod(&cluster, &pool)
+        }
+        .capacity_manifest(&profile);
+        let env = env_of(&manifest);
+        assert_eq!(env["GRADIENT_WORKER_SYSTEM_ARCHITECTURES"], "x86_64-linux");
+        for name in [
+            "GRADIENT_WORKER_SYSTEM_FEATURES",
+            "GRADIENT_WORKER_SYSTEM_CPU_CORE_SCORE",
+            "GRADIENT_WORKER_BUILD_MAX_CORES",
+            "NIX_CONFIG",
+        ] {
+            assert!(!env.contains_key(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn capacity_environment_preserves_literal_dollars_in_native_settings() {
+        let mut profile = capacity_profile();
+        profile.resources.architectures = vec!["arch$(NODE)".into()];
+        profile.resources.system_features = vec!["key$$name".into(), "key$(NODE)".into()];
+        let (cluster, mut pool) = (cluster(), pool());
+        pool.system = profile.resources.architectures[0].clone();
+        pool.features = profile.resources.system_features.clone();
+        pool.max_jobs = 2;
+        pool.validate_capacity_environment().unwrap();
+        let manifest = WorkerPod {
+            worker_id: profile.worker_id,
+            nix_config: capacity_nix_config(
+                &["https://cache.example.com/$(TENANT)".into()],
+                &["cache-key".into()],
+                &profile.resources.system_features,
+            ),
+            ..worker_pod(&cluster, &pool)
+        }
+        .capacity_manifest(&profile);
+        let env = env_of(&manifest);
+        assert_eq!(env["GRADIENT_WORKER_SYSTEM_ARCHITECTURES"], "arch$$(NODE)");
+        assert_eq!(
+            env["GRADIENT_WORKER_SYSTEM_FEATURES"],
+            "key$$$$name,key$$(NODE)"
+        );
+        assert_eq!(
+            env["NIX_CONFIG"],
+            "extra-substituters = https://cache.example.com/$$(TENANT)\nextra-trusted-public-keys = cache-key\nextra-system-features = key$$$$name key$$(NODE)"
+        );
+    }
+
+    #[test]
+    fn capacity_nix_features_do_not_require_cache_settings_or_replace_native_features() {
+        assert_eq!(
+            capacity_nix_config(&[], &[], &["signing-key".into()]),
+            Some("extra-system-features = signing-key".into())
+        );
+        assert_eq!(
+            capacity_nix_config(&["https://cache.example.com".into()], &["cache-key".into()], &[]),
+            Some("extra-substituters = https://cache.example.com\nextra-trusted-public-keys = cache-key".into())
+        );
     }
 
     #[test]

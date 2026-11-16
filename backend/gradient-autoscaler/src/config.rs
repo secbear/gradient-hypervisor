@@ -223,6 +223,25 @@ pub struct Pool {
     pub build_resources: Option<BuildResources>,
 }
 
+impl Pool {
+    pub(crate) fn validate_capacity_environment(&self) -> anyhow::Result<()> {
+        self.pod_options.validate_capacity_environment()?;
+        if self.system.is_empty() || self.system.contains(',') {
+            bail!("system cannot be encoded as one worker architecture");
+        }
+        for feature in &self.features {
+            if feature.is_empty()
+                || feature
+                    .chars()
+                    .any(|c| c.is_whitespace() || matches!(c, ',' | '#'))
+            {
+                bail!("feature {feature:?} cannot be encoded as one worker and Nix system feature");
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ConnectionFields {
@@ -391,6 +410,9 @@ impl TryFrom<ConnectionFields> for Connection {
                         connection.name
                     );
                 }
+                pool.validate_capacity_environment().map_err(|error| {
+                    anyhow::anyhow!("connection {}: pool {label}: {error:#}", connection.name)
+                })?;
             }
             connection.capacity_projects()?;
         }
@@ -750,5 +772,40 @@ mod tests {
             .remove("startupTimeout");
         entry["kubernetes"]["pools"]["x86"]["buildResources"]["memory"] = serde_json::json!("8Gi");
         assert!(error_of(&entry.to_string()).contains("unknown field"));
+    }
+
+    #[test]
+    fn capacity_environment_rejects_lossy_feature_encoding_only_when_enabled() {
+        for feature in [
+            "",
+            "key one",
+            "key,two",
+            "key#comment",
+            "key\nsetting = value",
+        ] {
+            let mut entry = preview_connection();
+            entry["kubernetes"]["pools"]["x86"]["features"] = serde_json::json!([feature]);
+            assert!(error_of(&entry.to_string()).contains("cannot be encoded"));
+            entry["buildScaling"] = serde_json::Value::Null;
+            assert!(Config::parse(&with_connections(&entry.to_string())).is_ok());
+        }
+        for system in ["", "x86_64-linux,aarch64-linux"] {
+            let mut entry = preview_connection();
+            entry["kubernetes"]["pools"]["x86"]["system"] = serde_json::json!(system);
+            assert!(error_of(&entry.to_string()).contains("one worker architecture"));
+        }
+    }
+
+    #[test]
+    fn capacity_environment_controls_native_settings_without_restricting_legacy_extensions() {
+        for name in pod_options::CAPACITY_ENV {
+            let mut entry = preview_connection();
+            entry["kubernetes"]["pools"]["x86"]["podOptions"] = serde_json::json!({
+                "env": [{"name": name, "value": "override"}]
+            });
+            assert!(error_of(&entry.to_string()).contains("controlled by the assessed profile"));
+            entry["buildScaling"] = serde_json::Value::Null;
+            assert!(Config::parse(&with_connections(&entry.to_string())).is_ok());
+        }
     }
 }

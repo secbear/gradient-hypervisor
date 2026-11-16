@@ -27,6 +27,13 @@ pub(crate) const CONTROLLED_ENV: &[&str] = &[
     "NIX_CONFIG",
 ];
 
+pub(crate) const CAPACITY_ENV: [&str; 4] = [
+    "GRADIENT_WORKER_SYSTEM_ARCHITECTURES",
+    "GRADIENT_WORKER_SYSTEM_FEATURES",
+    "GRADIENT_WORKER_SYSTEM_CPU_CORE_SCORE",
+    "GRADIENT_WORKER_BUILD_MAX_CORES",
+];
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct PodOptions {
@@ -39,6 +46,18 @@ pub struct PodOptions {
 }
 
 impl PodOptions {
+    pub(crate) fn validate_capacity_environment(&self) -> anyhow::Result<()> {
+        for env in &self.env {
+            if CAPACITY_ENV.contains(&env.name.as_str()) {
+                bail!(
+                    "environment {:?} is controlled by the assessed profile",
+                    env.name
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         let mut volumes = HashSet::new();
         for volume in &self.volumes {

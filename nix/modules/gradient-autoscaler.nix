@@ -106,7 +106,7 @@ let
             buildCores = mkOption {
               type = types.nullOr types.ints.unsigned;
               default = null;
-              description = "Assumed build core setting; null uses Gradient's automatic selection.";
+              description = "Build-core limit for prepared profiles; null or zero uses Gradient's automatic selection.";
             };
           };
         });

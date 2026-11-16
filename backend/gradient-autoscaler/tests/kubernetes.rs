@@ -386,7 +386,20 @@ async fn prepared_launch_uses_frozen_manifest_after_configuration_reload() {
     let server = MockServer::start().await;
     let _objects = prepared_objects(&server, LostResponse::None).await;
     let mut fixture = common::kubernetes_service(&server.uri()).await;
-    let profile = build_profile();
+    let mut profile = build_profile();
+    profile.resources.build_cores = Some(2);
+    profile.resources.system_features.push("signing-key".into());
+    if let gradient_autoscaler::launcher::Launcher::Kubernetes(launcher) =
+        &mut Arc::get_mut(&mut fixture.svc).unwrap().launcher
+    {
+        launcher
+            .config
+            .pools
+            .get_mut("x86")
+            .unwrap()
+            .features
+            .push("signing-key".into());
+    }
     let launch = prepare(&fixture.svc, &profile, OffsetDateTime::now_utc()).await;
     let svc = Arc::get_mut(&mut fixture.svc).unwrap();
     if let gradient_autoscaler::launcher::Launcher::Kubernetes(launcher) = &mut svc.launcher {
@@ -399,6 +412,27 @@ async fn prepared_launch_uses_frozen_manifest_after_configuration_reload() {
         json_of(&requests[0])["spec"]["containers"][0]["image"],
         "registry.example.com/gradient-worker:2.0.0"
     );
+    let manifest = json_of(&requests[0]);
+    let env = manifest["spec"]["containers"][0]["env"].as_array().unwrap();
+    for (name, value) in [
+        ("GRADIENT_WORKER_SYSTEM_ARCHITECTURES", "x86_64-linux"),
+        ("GRADIENT_WORKER_SYSTEM_FEATURES", "kvm,signing-key"),
+        ("GRADIENT_WORKER_SYSTEM_CPU_CORE_SCORE", "4000"),
+        ("GRADIENT_WORKER_BUILD_MAX_CORES", "2"),
+    ] {
+        assert!(
+            env.contains(&json!({"name": name, "value": value})),
+            "{name}"
+        );
+    }
+    let nix_config = env
+        .iter()
+        .find(|entry| entry["name"] == "NIX_CONFIG")
+        .unwrap();
+    assert_eq!(
+        nix_config["value"],
+        "extra-substituters = https://cache.example.com\nextra-trusted-public-keys = cache.example.com-1:abc=\nextra-system-features = kvm signing-key"
+    );
     assert_eq!(
         svc.state
             .launch("ops", launch.id)
@@ -408,6 +442,129 @@ async fn prepared_launch_uses_frozen_manifest_after_configuration_reload() {
             .build_intent,
         launch.build_intent
     );
+}
+
+#[tokio::test]
+async fn prepared_manifest_rejects_changes_to_profile_settings() {
+    let server = MockServer::start().await;
+    let _objects = prepared_objects(&server, LostResponse::None).await;
+    let fixture = common::kubernetes_service(&server.uri()).await;
+    let mut profile = build_profile();
+    profile.resources.build_cores = Some(2);
+    let launch = prepare(&fixture.svc, &profile, OffsetDateTime::now_utc()).await;
+    for (name, value) in [
+        ("GRADIENT_WORKER_SYSTEM_ARCHITECTURES", "aarch64-linux"),
+        ("GRADIENT_WORKER_SYSTEM_FEATURES", "other-feature"),
+        ("GRADIENT_WORKER_SYSTEM_CPU_CORE_SCORE", "5000"),
+        ("GRADIENT_WORKER_BUILD_MAX_CORES", "3"),
+        ("NIX_CONFIG", "extra-system-features = other-feature"),
+    ] {
+        let mut changed = launch.clone();
+        let spec = changed
+            .build_intent
+            .as_mut()
+            .unwrap()
+            .kubernetes
+            .as_mut()
+            .unwrap();
+        let env = spec.pod["spec"]["containers"][0]["env"]
+            .as_array_mut()
+            .unwrap();
+        env.iter_mut().find(|entry| entry["name"] == name).unwrap()["value"] = json!(value);
+        let state = gradient_autoscaler::state::State::memory().await.unwrap();
+        assert!(state.insert_launch(&changed).await.is_err(), "{name}");
+        assert!(state.open_launches("ops").await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn older_saved_manifests_keep_their_original_environment() {
+    let server = MockServer::start().await;
+    let _objects = prepared_objects(&server, LostResponse::None).await;
+    let mut fixture = common::kubernetes_service(&server.uri()).await;
+    let mut launch = prepare(&fixture.svc, &build_profile(), OffsetDateTime::now_utc()).await;
+    let intent = launch.build_intent.as_mut().unwrap();
+    let mut old = serde_json::to_value(intent.kubernetes.as_ref().unwrap()).unwrap();
+    old.as_object_mut().unwrap().remove("profile_environment");
+    let env = old["pod"]["spec"]["containers"][0]["env"]
+        .as_array_mut()
+        .unwrap();
+    env.retain(|entry| {
+        ![
+            "GRADIENT_WORKER_SYSTEM_ARCHITECTURES",
+            "GRADIENT_WORKER_SYSTEM_FEATURES",
+            "GRADIENT_WORKER_SYSTEM_CPU_CORE_SCORE",
+            "GRADIENT_WORKER_BUILD_MAX_CORES",
+        ]
+        .iter()
+        .any(|name| entry["name"] == *name)
+    });
+    env.iter_mut()
+        .find(|entry| entry["name"] == "NIX_CONFIG")
+        .unwrap()["value"] = json!(
+        "extra-substituters = https://cache.example.com\nextra-trusted-public-keys = cache.example.com-1:abc="
+    );
+    let old_pod = old["pod"].clone();
+    let old_spec: gradient_autoscaler::kubernetes::KubernetesLaunchSpec =
+        serde_json::from_value(old).unwrap();
+    assert!(!old_spec.profile_environment);
+    assert!(
+        serde_json::to_value(&old_spec)
+            .unwrap()
+            .get("profile_environment")
+            .is_none()
+    );
+    intent.kubernetes = Some(old_spec);
+    let svc = Arc::get_mut(&mut fixture.svc).unwrap();
+    svc.state = gradient_autoscaler::state::State::memory().await.unwrap();
+    svc.state.insert_launch(&launch).await.unwrap();
+    let restored = svc.state.launch("ops", launch.id).await.unwrap().unwrap();
+    assert_eq!(restored.build_intent, launch.build_intent);
+    svc.launcher.launch_prepared(svc, launch.id).await.unwrap();
+    let requests = received(&server, "POST", PODS).await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(json_of(&requests[0])["spec"], old_pod["spec"]);
+}
+
+#[tokio::test]
+async fn prepared_launch_rejects_capacity_environment_overrides_before_http() {
+    let server = MockServer::start().await;
+    let mut config = common::kubernetes();
+    config.pools.get_mut("x86").unwrap().pod_options = serde_json::from_value(json!({
+        "env": [{"name": "GRADIENT_WORKER_SYSTEM_FEATURES", "value": "other-feature"}]
+    }))
+    .unwrap();
+    let fixture = common::kubernetes_service_with_config(&server.uri(), config).await;
+    let profile = build_profile();
+    let planned = PlannedBuildWorker {
+        profile_index: 0,
+        label: "x86".into(),
+        worker_id: profile.worker_id,
+    };
+    assert!(
+        fixture
+            .svc
+            .launcher
+            .prepare_build_launch(
+                &fixture.svc,
+                &planned,
+                &profile,
+                &build_policy(),
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .svc
+            .state
+            .open_launches("ops")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -518,11 +675,32 @@ async fn prepared_launch_does_not_recreate_missing_credentials_or_foreign_owned_
         "secret_uid",
         "pod_uid",
         "immutable",
+        "automatic_cores",
+        "automatic_features",
+        "automatic_score",
     ] {
         let server = MockServer::start().await;
         let objects = prepared_objects(&server, LostResponse::None).await;
-        let fixture = common::kubernetes_service(&server.uri()).await;
-        let launch = prepare(&fixture.svc, &build_profile(), OffsetDateTime::now_utc()).await;
+        let mut fixture = common::kubernetes_service(&server.uri()).await;
+        let mut profile = build_profile();
+        if corruption == "automatic_features" {
+            profile.resources.system_features.clear();
+            if let gradient_autoscaler::launcher::Launcher::Kubernetes(launcher) =
+                &mut Arc::get_mut(&mut fixture.svc).unwrap().launcher
+            {
+                launcher
+                    .config
+                    .pools
+                    .get_mut("x86")
+                    .unwrap()
+                    .features
+                    .clear();
+            }
+        }
+        if corruption == "automatic_score" {
+            profile.resources.cpu_core_score = 0;
+        }
+        let launch = prepare(&fixture.svc, &profile, OffsetDateTime::now_utc()).await;
         fixture
             .svc
             .launcher
@@ -553,6 +731,20 @@ async fn prepared_launch_does_not_recreate_missing_credentials_or_foreign_owned_
                     objects.pod.as_mut().unwrap()["metadata"]["uid"] = json!("replaced-pod")
                 }
                 "immutable" => objects.secret.as_mut().unwrap()["immutable"] = json!(false),
+                "automatic_cores" | "automatic_features" | "automatic_score" => {
+                    let (name, value) = match corruption {
+                        "automatic_cores" => ("GRADIENT_WORKER_BUILD_MAX_CORES", "1"),
+                        "automatic_features" => {
+                            ("GRADIENT_WORKER_SYSTEM_FEATURES", "other-feature")
+                        }
+                        "automatic_score" => ("GRADIENT_WORKER_SYSTEM_CPU_CORE_SCORE", "5000"),
+                        _ => unreachable!(),
+                    };
+                    objects.pod.as_mut().unwrap()["spec"]["containers"][0]["env"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({"name": name, "value": value}));
+                }
                 _ => unreachable!(),
             }
         }

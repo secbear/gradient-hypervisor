@@ -1,6 +1,9 @@
 use super::KubernetesLauncher;
 use super::client::Pod;
-use super::pod::{CONNECTION_LABEL, LAUNCH_LABEL, POOL_LABEL, WorkerPod, nix_config, pod_name};
+use super::pod::{
+    CONNECTION_LABEL, LAUNCH_LABEL, POOL_LABEL, WorkerPod, capacity_environment,
+    capacity_features_setting, capacity_nix_config, pod_name,
+};
 use crate::build_planner::{BuildScalingPolicy, PlannedBuildWorker};
 use crate::capacity::BuildCapacityProfile;
 use crate::gradient::worker_server_url;
@@ -29,6 +32,13 @@ pub struct KubernetesLaunchSpec {
     pub api_url: Url,
     pub namespace: String,
     pub pod: Value,
+    /// Older saved Pods do not contain profile-derived worker settings.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub profile_environment: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn labels(launch: &Launch) -> BTreeMap<String, String> {
@@ -70,6 +80,48 @@ fn pod_worker_id(spec: &PodSpec) -> anyhow::Result<Uuid> {
         .parse()?;
     ensure!(ids.next().is_none(), "pod has duplicate worker identities");
     Ok(id)
+}
+
+fn validate_profile_environment(
+    worker: &Container,
+    profile: &BuildCapacityProfile,
+) -> anyhow::Result<()> {
+    for (name, expected) in capacity_environment(profile) {
+        let entries = worker
+            .env
+            .iter()
+            .flatten()
+            .filter(|entry| entry.name == name)
+            .collect::<Vec<_>>();
+        match expected {
+            Some(expected) => ensure!(
+                entries.len() == 1 && entries[0].value.as_deref() == Some(expected.as_str()),
+                "prepared pod {name} differs from assessed profile"
+            ),
+            None => ensure!(
+                entries.is_empty(),
+                "prepared pod overrides automatic {name}"
+            ),
+        }
+    }
+    if let Some(expected) = capacity_features_setting(&profile.resources.system_features) {
+        let entries = worker
+            .env
+            .iter()
+            .flatten()
+            .filter(|entry| entry.name == "NIX_CONFIG")
+            .collect::<Vec<_>>();
+        ensure!(
+            entries.len() == 1
+                && entries[0]
+                    .value
+                    .as_deref()
+                    .and_then(|value| value.lines().last())
+                    == Some(expected.as_str()),
+            "prepared Nix system features differ from assessed profile"
+        );
+    }
+    Ok(())
 }
 
 impl KubernetesLaunchSpec {
@@ -138,10 +190,18 @@ impl KubernetesLaunchSpec {
                 "prepared pod {name} differs from profile"
             );
         }
+        if self.profile_environment {
+            validate_profile_environment(worker, profile)?;
+        }
         Ok(())
     }
 
-    fn owned_pod(&self, pod: &Pod, launch: &Launch) -> anyhow::Result<()> {
+    fn owned_pod(
+        &self,
+        pod: &Pod,
+        launch: &Launch,
+        profile: &BuildCapacityProfile,
+    ) -> anyhow::Result<()> {
         ensure!(
             pod.metadata.name == launch.external_id
                 && !pod.metadata.uid.is_empty()
@@ -171,6 +231,9 @@ impl KubernetesLaunchSpec {
                 }),
             "existing pod worker settings differ from prepared launch"
         );
+        if self.profile_environment {
+            validate_profile_environment(observed, profile)?;
+        }
         Ok(())
     }
 
@@ -227,6 +290,7 @@ impl KubernetesLauncher {
         now: OffsetDateTime,
     ) -> anyhow::Result<Launch> {
         svc.ensure_mutations_allowed()?;
+        profile.validate()?;
         ensure!(
             planned.worker_id == profile.worker_id,
             "planned worker identity differs from profile"
@@ -240,6 +304,7 @@ impl KubernetesLauncher {
             .pools
             .get(&planned.label)
             .context("planned pool is not configured")?;
+        pool.validate_capacity_environment()?;
         ensure!(
             profile.resources.architectures == [pool.system.clone()]
                 && profile
@@ -278,12 +343,13 @@ impl KubernetesLauncher {
             worker_id: planned.worker_id,
             idle_timeout: svc.conn.idle_timeout,
             max_lifetime: svc.conn.max_lifetime,
-            nix_config: nix_config(
+            nix_config: capacity_nix_config(
                 &svc.conn.worker_substituters,
                 &svc.conn.worker_trusted_public_keys,
+                &profile.resources.system_features,
             ),
         }
-        .manifest();
+        .capacity_manifest(profile);
         launch.build_intent = Some(BuildLaunchIntent {
             profile: profile.clone(),
             startup_deadline: now
@@ -296,6 +362,7 @@ impl KubernetesLauncher {
                 api_url: self.client.api_url().clone(),
                 namespace: self.client.namespace().into(),
                 pod,
+                profile_environment: true,
             }),
         });
         svc.state.insert_launch(&launch).await?;
@@ -341,7 +408,7 @@ impl KubernetesLauncher {
         );
         let mut pod = self.client.pod(&launch.external_id).await?;
         if let Some(pod) = &pod {
-            spec.owned_pod(pod, &launch)?;
+            spec.owned_pod(pod, &launch, &intent.profile)?;
             ensure!(
                 launch.registration_started,
                 "pod exists before prepared registration started"
@@ -484,7 +551,7 @@ impl KubernetesLauncher {
             });
         }
         let pod = pod.context("prepared pod is missing")?;
-        spec.owned_pod(&pod, &launch)?;
+        spec.owned_pod(&pod, &launch, &intent.profile)?;
         svc.state
             .bind_build_objects(&launch, secret_uid, Some(&pod.metadata.uid))
             .await?;

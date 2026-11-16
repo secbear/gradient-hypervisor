@@ -28,6 +28,8 @@ Set a Kubernetes connection's `buildScaling` to `{"mode":"preview","profiles":["
 
 Each selected pool needs `buildResources`, for example `{"cpuCount":4,"ramTotalMb":7000,"cpuCoreScore":4000,"buildCores":null}`. These are planning assumptions, not measured resources or conversions of Kubernetes `cpu` and `memory` quantities. `ramTotalMb` excludes worker overhead.
 
+Prepared launches pass the assessed architectures, nonempty feature list, positive core score and positive build-core limit through the worker's native options. The same features are added to Nix's system features. Empty features retain detection; a zero core score or null/zero core limit retains the native automatic behavior. CPU count and usable RAM still require validation against actual worker budgets.
+
 `queueWait` defaults to 60 seconds, `startupGrace` to 120 seconds, and `maxNewWorkers` to 2. Plans retain the existing total and per-pool launch limits and failure backoff. The number of profiles times `max(1, maxNewWorkers)` must not exceed 16. Scoped `projects` must contain IDs; `null` means all granting projects and `[]` means none. A server without the assessment API produces an error, not a legacy scaling fallback. Preview uses the existing catch-up interval; it does not install a demand webhook.
 
 ### GitHub Actions
