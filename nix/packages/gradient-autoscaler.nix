@@ -1,4 +1,4 @@
-{ lib, craneLib, cacert }:
+{ lib, craneLib, cacert, cargoBuildExtraArgs ? "" }:
 let
   root = ../../backend;
 
@@ -24,7 +24,7 @@ let
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 in
 craneLib.buildPackage (commonArgs // {
-  inherit cargoArtifacts;
+  inherit cargoArtifacts cargoBuildExtraArgs;
   doCheck = false;
 
   passthru = {

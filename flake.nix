@@ -29,11 +29,17 @@
         inherit pkgs;
         inherit (gradient.packages.${system}) gradient gradient-nix;
       };
+
+      gradient-kubernetes-test-image = pkgs.callPackage ./nix/tests/kubernetes/image.nix {
+        autoscaler = self.packages.${system}.gradient-autoscaler;
+        inherit (gradient.packages.${system}) gradient gradient-nix;
+      };
     });
 
     checks = forAllSystems (pkgs: {
       inherit (self.packages.${pkgs.stdenv.hostPlatform.system}.gradient-autoscaler) tests clippy fmt;
       helm = pkgs.callPackage ./nix/tests/helm.nix { };
+      kubernetes-fixture = pkgs.callPackage ./nix/tests/kubernetes/check.nix { };
     } // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
       module = pkgs.callPackage ./nix/tests/module.nix {
         nixosModule = self.nixosModules.gradient-autoscaler;

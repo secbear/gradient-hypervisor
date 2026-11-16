@@ -61,6 +61,31 @@ skopeo copy docker-archive:result docker://registry.example.com/gradient-worker:
 
 The worker image uses the `gradient` flake input. Match it to the server version, or build an image for another Gradient package with `lib.mkWorkerImage { pkgs, gradient, gradient-nix }`.
 
+## Local Integration Test
+
+The local fixture starts real Gradient and PostgreSQL in a fresh Kind cluster. It tests prepared-worker registration, live inventory, process-restart recovery, literal system features and scoped cleanup. It does not test backlog scaling or CPU/RAM enforcement.
+
+Set `GRADIENT_SOURCE` to a Git flake URL selecting a revision with the capacity assessment API and API-key access to team-worker endpoints. Session-only revisions fail authentication; the fixture does not substitute a session token. Git-filtered sources exclude local build artifacts. Build the matched test and worker images:
+
+```sh
+nix build --builders '' --no-write-lock-file --no-link --print-out-paths \
+  --override-input gradient "$GRADIENT_SOURCE" \
+  .#gradient-kubernetes-test-image .#gradient-worker-image
+```
+
+Pass the printed archives as `TEST_IMAGE_ARCHIVE` and `WORKER_IMAGE_ARCHIVE`. For rootless Podman, run the fixture in a delegated scope:
+
+```sh
+systemd-run --user --scope --property=Delegate=yes \
+  nix shell --builders '' --inputs-from . \
+  nixpkgs#kind nixpkgs#kubectl nixpkgs#kubernetes-helm nixpkgs#python3 \
+  --command python3 nix/tests/kubernetes/prepared.py \
+  --test-image-archive "$TEST_IMAGE_ARCHIVE" \
+  --worker-image-archive "$WORKER_IMAGE_ARCHIVE"
+```
+
+The fixture uses temporary credentials and its own kubeconfig, refuses unexpected cluster endpoints or nodes, and deletes its cluster after success or failure. Use `--provider docker` to select Docker instead of Podman.
+
 ## Helm
 
 `helm/gradient-autoscaler` deploys the autoscaler into a cluster: a Deployment with a state volume, its config, a Service, an optional Ingress for `/c/`, and a ServiceAccount with a Role in every worker namespace.
