@@ -180,7 +180,7 @@ let
         example = "/run/secrets/kubernetes-token";
         description = ''
           Path to a file holding a bearer token for a service account that may create, read, list and delete
-          pods and create secrets in {option}`${option "kubernetes.namespace"}`.
+          pods and create, read and update secrets in {option}`${option "kubernetes.namespace"}`.
         '';
       };
 

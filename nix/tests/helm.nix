@@ -10,6 +10,12 @@ runCommand "gradient-autoscaler-helm" { nativeBuildInputs = [ kubernetes-helm yq
   helm lint --strict ${chart}
   helm lint --strict ${chart} -f ${chart}/ci/kubernetes-values.yaml
   helm template check ${chart} -n ci -f ${chart}/ci/kubernetes-values.yaml > $out
+  yq -o=json 'select(.kind == "Role" and .metadata.namespace == "gradient-workers") | .rules' $out | jq -e '
+    map(.verbs |= sort) | sort_by(.resources) == [
+      {"apiGroups": [""], "resources": ["pods"], "verbs": ["create", "delete", "get", "list"]},
+      {"apiGroups": [""], "resources": ["secrets"], "verbs": ["create", "get", "update"]}
+    ]
+  ' >/dev/null
   yq -r 'select(.kind == "ConfigMap") | .data."config.json"' $out | jq -e '
     .connections[] | select(.name == "platform") |
     .workerCapabilities == {"eval": false, "secrets": false} and
