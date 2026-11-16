@@ -1,8 +1,9 @@
 use super::KubernetesLauncher;
 use super::client::Pod;
 use super::pod::{
-    CONNECTION_LABEL, LAUNCH_LABEL, POOL_LABEL, WorkerPod, capacity_environment,
-    capacity_features_setting, capacity_nix_config, pod_name,
+    CONNECTION_LABEL, LAUNCH_LABEL, POOL_LABEL, PROFILE_ENVIRONMENT_ANNOTATION,
+    PROFILE_ENVIRONMENT_VERSION, WorkerPod, capacity_environment, capacity_features_setting,
+    capacity_nix_config, pod_name,
 };
 use crate::build_planner::{BuildScalingPolicy, PlannedBuildWorker};
 use crate::capacity::BuildCapacityProfile;
@@ -32,13 +33,20 @@ pub struct KubernetesLaunchSpec {
     pub api_url: Url,
     pub namespace: String,
     pub pod: Value,
-    /// Older saved Pods do not contain profile-derived worker settings.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub profile_environment: bool,
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
+fn profile_environment_enabled(pod: &NativePod) -> anyhow::Result<bool> {
+    // Version the captured Pod without changing the strict launch-state schema.
+    let version = pod
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(PROFILE_ENVIRONMENT_ANNOTATION));
+    ensure!(
+        version.is_none_or(|version| version == PROFILE_ENVIRONMENT_VERSION),
+        "unsupported prepared profile environment version"
+    );
+    Ok(version.is_some())
 }
 
 fn labels(launch: &Launch) -> BTreeMap<String, String> {
@@ -131,6 +139,7 @@ impl KubernetesLaunchSpec {
         profile: &BuildCapacityProfile,
     ) -> anyhow::Result<()> {
         let pod: NativePod = serde_json::from_value(self.pod.clone())?;
+        let profile_environment = profile_environment_enabled(&pod)?;
         ensure!(
             pod.metadata.name.as_deref() == Some(launch.external_id.as_str())
                 && launch.external_id == pod_name(launch.id),
@@ -190,7 +199,7 @@ impl KubernetesLaunchSpec {
                 "prepared pod {name} differs from profile"
             );
         }
-        if self.profile_environment {
+        if profile_environment {
             validate_profile_environment(worker, profile)?;
         }
         Ok(())
@@ -216,6 +225,7 @@ impl KubernetesLaunchSpec {
             "existing pod does not belong to prepared launch"
         );
         let expected: NativePod = serde_json::from_value(self.pod.clone())?;
+        let profile_environment = profile_environment_enabled(&expected)?;
         let expected =
             worker_container(expected.spec.as_ref().context("prepared pod has no spec")?)?;
         let observed = worker_container(pod.spec.as_ref().context("pod has no spec")?)?;
@@ -231,7 +241,7 @@ impl KubernetesLaunchSpec {
                 }),
             "existing pod worker settings differ from prepared launch"
         );
-        if self.profile_environment {
+        if profile_environment {
             validate_profile_environment(observed, profile)?;
         }
         Ok(())
@@ -362,7 +372,6 @@ impl KubernetesLauncher {
                 api_url: self.client.api_url().clone(),
                 namespace: self.client.namespace().into(),
                 pod,
-                profile_environment: true,
             }),
         });
         svc.state.insert_launch(&launch).await?;

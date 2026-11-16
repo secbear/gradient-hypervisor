@@ -413,6 +413,10 @@ async fn prepared_launch_uses_frozen_manifest_after_configuration_reload() {
         "registry.example.com/gradient-worker:2.0.0"
     );
     let manifest = json_of(&requests[0]);
+    assert_eq!(
+        manifest["metadata"]["annotations"]["gradient.wavelens.io/profile-environment"],
+        "1"
+    );
     let env = manifest["spec"]["containers"][0]["env"].as_array().unwrap();
     for (name, value) in [
         ("GRADIENT_WORKER_SYSTEM_ARCHITECTURES", "x86_64-linux"),
@@ -475,6 +479,17 @@ async fn prepared_manifest_rejects_changes_to_profile_settings() {
         assert!(state.insert_launch(&changed).await.is_err(), "{name}");
         assert!(state.open_launches("ops").await.unwrap().is_empty());
     }
+    let mut changed = launch.clone();
+    let spec = changed
+        .build_intent
+        .as_mut()
+        .unwrap()
+        .kubernetes
+        .as_mut()
+        .unwrap();
+    spec.pod["metadata"]["annotations"]["gradient.wavelens.io/profile-environment"] = json!("99");
+    let state = gradient_autoscaler::state::State::memory().await.unwrap();
+    assert!(state.insert_launch(&changed).await.is_err());
 }
 
 #[tokio::test]
@@ -485,7 +500,10 @@ async fn older_saved_manifests_keep_their_original_environment() {
     let mut launch = prepare(&fixture.svc, &build_profile(), OffsetDateTime::now_utc()).await;
     let intent = launch.build_intent.as_mut().unwrap();
     let mut old = serde_json::to_value(intent.kubernetes.as_ref().unwrap()).unwrap();
-    old.as_object_mut().unwrap().remove("profile_environment");
+    old["pod"]["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("annotations");
     let env = old["pod"]["spec"]["containers"][0]["env"]
         .as_array_mut()
         .unwrap();
@@ -507,13 +525,7 @@ async fn older_saved_manifests_keep_their_original_environment() {
     let old_pod = old["pod"].clone();
     let old_spec: gradient_autoscaler::kubernetes::KubernetesLaunchSpec =
         serde_json::from_value(old).unwrap();
-    assert!(!old_spec.profile_environment);
-    assert!(
-        serde_json::to_value(&old_spec)
-            .unwrap()
-            .get("profile_environment")
-            .is_none()
-    );
+    assert!(old_spec.pod["metadata"].get("annotations").is_none());
     intent.kubernetes = Some(old_spec);
     let svc = Arc::get_mut(&mut fixture.svc).unwrap();
     svc.state = gradient_autoscaler::state::State::memory().await.unwrap();

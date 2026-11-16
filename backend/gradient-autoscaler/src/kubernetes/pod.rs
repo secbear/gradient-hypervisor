@@ -9,6 +9,8 @@ use uuid::Uuid;
 pub const CONNECTION_LABEL: &str = "gradient.wavelens.io/connection";
 pub const LAUNCH_LABEL: &str = "gradient.wavelens.io/launch";
 pub const POOL_LABEL: &str = "gradient.wavelens.io/pool";
+pub(crate) const PROFILE_ENVIRONMENT_ANNOTATION: &str = "gradient.wavelens.io/profile-environment";
+pub(crate) const PROFILE_ENVIRONMENT_VERSION: &str = "1";
 const GRACE_SECONDS: u64 = 600;
 const START_FAILURES: [&str; 5] = [
     "ErrImagePull",
@@ -39,6 +41,8 @@ pub fn pod_name(launch_id: Uuid) -> String {
 impl WorkerPod<'_> {
     pub(crate) fn capacity_manifest(&self, profile: &BuildCapacityProfile) -> Value {
         let mut manifest = self.manifest();
+        manifest["metadata"]["annotations"][PROFILE_ENVIRONMENT_ANNOTATION] =
+            json!(PROFILE_ENVIRONMENT_VERSION);
         manifest["spec"]["containers"][0]["env"]
             .as_array_mut()
             .unwrap()
