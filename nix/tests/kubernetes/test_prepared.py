@@ -1,5 +1,6 @@
 """Check fixture locality and failure cleanup without starting tools or clusters."""
 
+import base64
 import json
 import tempfile
 from pathlib import Path
@@ -23,6 +24,44 @@ def nodes(*names):
 
 
 class FixtureGuards(unittest.TestCase):
+    def test_api_key_auth_is_the_default(self):
+        with patch("prepared.Fixture") as factory, \
+                patch("prepared.tempfile.TemporaryDirectory") as temporary:
+            temporary.return_value.__enter__.return_value = "/unused"
+            self.assertEqual(main(["--test-image-archive", "/unused/test.tar",
+                                   "--worker-image-archive", "/unused/worker.tar"]), 0)
+        self.assertEqual(factory.call_args.args[0].auth, "api-key")
+
+    def test_driver_credential_modes_are_explicit(self):
+        for mode in ("api-key", "session"):
+            with self.subTest(mode=mode):
+                subject = fixture()
+                subject.args.auth = mode
+                with patch.object(subject, "api", return_value="issued-api-key") as api, \
+                        patch.object(subject, "secret") as secret, \
+                        patch("builtins.print") as output:
+                    subject.driver_credential("temporary-session")
+                credential = "temporary-session" if mode == "session" else "issued-api-key"
+                secret.assert_called_once_with("driver-key", {"api-key": credential})
+                if mode == "session":
+                    api.assert_not_called()
+                    self.assertIn("API-key compatibility is not validated", output.call_args.args[0])
+                else:
+                    api.assert_called_once_with("user/keys", {
+                        "name": "prepared-fixture", "expires_in_days": 1,
+                        "permissions": ["viewProject", "manageWorkers"],
+                    }, "temporary-session")
+                    output.assert_not_called()
+
+    def test_api_key_failure_does_not_fall_back_to_a_session(self):
+        subject = fixture()
+        subject.args.auth = "api-key"
+        with patch.object(subject, "api", side_effect=RuntimeError("key failed")), \
+                patch.object(subject, "secret") as secret:
+            with self.assertRaisesRegex(RuntimeError, "key failed"):
+                subject.driver_credential("temporary-session")
+        secret.assert_not_called()
+
     def test_rejects_nonlocal_endpoints_before_reading_nodes(self):
         for url in ("https://remote.example:443", "http://127.0.0.1:1234",
                     "https://user:password@127.0.0.1:1234", "https://127.0.0.1"):
@@ -150,6 +189,9 @@ class FixtureGuards(unittest.TestCase):
             subject.secret("key", {"api-key": "sensitive-token"})
         self.assertNotIn("sensitive-token", subject.safe("sensitive-token"))
         self.assertNotIn("c2Vuc2l0aXZlLXRva2Vu", subject.safe("c2Vuc2l0aXZlLXRva2Vu"))
+        subject.redact_credentials(["", "temporary-peer-token"])
+        self.assertNotIn("temporary-peer-token", subject.safe("temporary-peer-token"))
+        self.assertEqual(subject.safe("unchanged"), "unchanged")
         subject.guarded = True
         pod = {"metadata": {"name": "worker"}, "spec": {"containers": [
             {"name": "worker", "env": [{"name": "TOKEN", "value": "unknown-worker-token"}]}]},
@@ -159,10 +201,14 @@ class FixtureGuards(unittest.TestCase):
                }]}}
         with patch.object(subject, "kubectl", side_effect=[
             "sensitive-token", "", "", json.dumps({"items": [pod]}),
+            json.dumps({"data": {"peers": base64.b64encode(
+                b"peer:unknown-worker-token\n").decode()}}),
+            "worker output unknown-worker-token",
         ]), patch("builtins.print") as output:
             subject.logs(failed=True)
         text = "\n".join(str(call.args[0]) for call in output.call_args_list)
         self.assertIn("Unschedulable", text)
+        self.assertIn("worker logs:", text)
         self.assertNotIn("sensitive-token", text)
         self.assertNotIn("unknown-worker-token", text)
 

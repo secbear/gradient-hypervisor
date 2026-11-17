@@ -63,9 +63,9 @@ The worker image uses the `gradient` flake input. Match it to the server version
 
 ## Local Integration Test
 
-The local fixture starts real Gradient and PostgreSQL in a fresh Kind cluster. It tests prepared-worker registration, live inventory, process-restart recovery, literal system features and scoped cleanup. It does not test backlog scaling or CPU/RAM enforcement.
+The local fixture starts real Gradient and PostgreSQL in a fresh Kind cluster and provisions a private cache for its test project. It tests prepared-worker registration, live inventory, process-restart recovery, literal system features and scoped cleanup. It does not test backlog scaling or CPU/RAM enforcement.
 
-Set `GRADIENT_SOURCE` to a Git flake URL selecting a revision with the capacity assessment API and API-key access to team-worker endpoints. Session-only revisions fail authentication; the fixture does not substitute a session token. Git-filtered sources exclude local build artifacts. Build the matched test and worker images:
+Set `GRADIENT_SOURCE` to a Git flake URL selecting a revision with the capacity assessment API. Git-filtered sources exclude local build artifacts. Build the matched test and worker images:
 
 ```sh
 nix build --builders '' --no-write-lock-file --no-link --print-out-paths \
@@ -85,6 +85,8 @@ systemd-run --user --scope --property=Delegate=yes \
 ```
 
 The fixture uses temporary credentials and its own kubeconfig, refuses unexpected cluster endpoints or nodes, and deletes its cluster after success or failure. Use `--provider docker` to select Docker instead of Podman.
+
+API-key authentication is the default and fails on session-only team endpoints. Add `--auth session` to test the lifecycle with the disposable admin login. Session mode does not validate API-key compatibility, and API-key failures never fall back to a session.
 
 ## Helm
 

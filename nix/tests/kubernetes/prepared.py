@@ -91,11 +91,16 @@ class Fixture:
             "metadata": {"name": name, "namespace": NAMESPACE}, **body,
         }))
 
-    def secret(self, name, values):
-        for value in values.values():
+    def redact_credentials(self, values):
+        for value in values:
+            if not value:
+                continue
             self.redactions.update(part for part in value.splitlines() if len(part) >= 8)
             self.redactions.add(value)
             self.redactions.add(base64.b64encode(value.encode()).decode())
+
+    def secret(self, name, values):
+        self.redact_credentials(values.values())
         self.apply("Secret", name, type="Opaque", stringData=values)
 
     def deploy(self, name, container, volumes, user, cpu, memory):
@@ -138,6 +143,17 @@ class Fixture:
                      "--retry", "20", "--retry-connrefused", "--retry-delay", "1",
                      "--retry-max-time", "30", GRADIENT_URL + "/api/v1/health")
 
+    def driver_credential(self, session):
+        if self.args.auth == "session":
+            print("SESSION TEST MODE: lifecycle checks only; API-key compatibility is not validated.")
+            credential = session
+        else:
+            credential = self.api("user/keys", {
+                "name": "prepared-fixture", "expires_in_days": 1,
+                "permissions": ["viewProject", "manageWorkers"],
+            }, session)
+        self.secret("driver-key", {"api-key": credential})
+
     def bootstrap(self):
         password, pg_password = secrets.token_urlsafe(24), secrets.token_urlsafe(32)
         self.redactions.add(password)
@@ -151,7 +167,8 @@ fi
 exec postgres -D /data/pg -h 0.0.0.0 -k /data \
   -c max_connections=200 -c max_locks_per_transaction=1024
 """],
-            "env": [{"name": "PGPASSWORD", "valueFrom": {
+            "env": [{"name": "HOME", "value": "/data/pg"},
+                    {"name": "PGPASSWORD", "valueFrom": {
                 "secretKeyRef": {"name": "database", "key": "password"}}}],
             "volumeMounts": [{"name": "data", "mountPath": "/data"},
                              {"name": "credentials", "mountPath": "/credentials", "readOnly": True}],
@@ -166,9 +183,14 @@ exec postgres -D /data/pg -h 0.0.0.0 -k /data \
         private_key = self.kubectl("exec", "deployment/postgres", "--", "/bin/bash", "-euc",
                                   'd=$(mktemp -d); trap \'rm -rf "$d"\' EXIT; '
                                   'ssh-keygen -q -t ed25519 -N "" -f "$d/key"; cat "$d/key"')
+        cache_key = self.kubectl("exec", "deployment/postgres", "--", "/bin/bash", "-euc",
+                                'd=$(mktemp -d); trap \'rm -rf "$d"\' EXIT; '
+                                'nix-store --store dummy:// --generate-binary-cache-key fixture "$d/key" "$d/pub"; '
+                                'cat "$d/key"')
         self.secret("credentials", {
             "gradient_user_fixture_password": hashed,
             "gradient_project_fixture_private_key": private_key,
+            "gradient_cache_fixture_signing_key": cache_key.split(":", 1)[1].strip(),
             "jwt": base64.b64encode(secrets.token_bytes(48)).decode(),
             "crypt": base64.b64encode(secrets.token_bytes(48)).decode(),
             "database-url": f"postgresql://postgres:{pg_password}@postgres:5432/gradient",
@@ -183,6 +205,10 @@ exec postgres -D /data/pg -h 0.0.0.0 -k /data \
                                      "private_key_file": "mounted", "public": False,
                                      "teams": [{"team": "fixture", "role": "Admin",
                                                 "users": True, "workers": True}]}},
+            "caches": {"fixture": {"name": "fixture", "display_name": "Fixture",
+                                  "public": False, "created_by": "fixture",
+                                  "signing_key_file": "mounted", "projects": ["fixture"],
+                                  "upstream_caches": []}},
         }
         self.apply("ConfigMap", "server-state", data={"state.json": json.dumps(state)})
         self.deploy("gradient", {
@@ -204,9 +230,7 @@ exec postgres -D /data/pg -h 0.0.0.0 -k /data \
         self.wait_api()
         token = self.api("auth/basic/login", {"loginname": "fixture", "password": password})
         self.redactions.add(token)
-        key = self.api("user/keys", {"name": "prepared-fixture", "expires_in_days": 1,
-                                   "permissions": ["viewProject", "manageWorkers"]}, token)
-        self.secret("driver-key", {"api-key": key})
+        self.driver_credential(token)
 
     def driver(self):
         capabilities = dict(build=True, network=True, eval=False, secrets=False, exec=False)
@@ -341,6 +365,17 @@ exec postgres -D /data/pg -h 0.0.0.0 -k /data \
                         } for container in status.get("containerStatuses", [])[:3]],
                     }
                     print("worker status: " + self.safe(json.dumps(diagnostics))[:2000])
+                    try:
+                        name = pod["metadata"]["name"]
+                        secret = json.loads(self.kubectl("get", "secret", name, "-o", "json"))
+                        peers = base64.b64decode(secret["data"]["peers"]).decode()
+                        self.redact_credentials([
+                            peers, *[line.partition(":")[2] for line in peers.splitlines()],
+                        ])
+                        text = self.kubectl("logs", name, "--tail=80", "--limit-bytes=8000")
+                        print("worker logs:\n" + self.safe(text))
+                    except Exception:
+                        print("worker logs unavailable", file=sys.stderr)
             except Exception:
                 print("worker status unavailable", file=sys.stderr)
 
@@ -353,6 +388,8 @@ def main(argv=None):
     parser.add_argument("--test-image-archive", required=True, type=Path)
     parser.add_argument("--worker-image-archive", required=True, type=Path)
     parser.add_argument("--provider", choices=("podman", "docker"), default="podman")
+    parser.add_argument("--auth", choices=("api-key", "session"), default="api-key",
+                        help="Authentication for the disposable test driver.")
     parser.add_argument("--chart", type=Path,
                         default=Path(__file__).resolve().parents[3] / "helm/gradient-autoscaler")
     args = parser.parse_args(argv)
