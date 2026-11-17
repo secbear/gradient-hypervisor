@@ -46,6 +46,8 @@ Prepared launches pass the assessed architectures, nonempty feature list, positi
 - Tasks using the autoscaler need `wait_for_workers`, so evaluations wait for a worker to start instead of aborting after 300 seconds.
 - Gradient must reach `publicUrl` for the `worker.demand` webhook.
 - The API key belongs to a user with the Admin role in the team.
+- Gradient must support team-pinned API keys. Pin the key to the configured team and grant `manageWorkers`, plus `manageWebhooks` for webhook setup. Existing unpinned, project-pinned and cache-pinned keys cannot manage a team fleet.
+- Upgrade every Gradient server instance before issuing team-pinned keys. Older instances do not enforce the team scope.
 
 ## Images
 

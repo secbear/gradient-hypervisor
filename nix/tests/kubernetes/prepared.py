@@ -121,9 +121,12 @@ class Fixture:
         self.apply("Service", name, spec={"selector": {"app": name},
                                          "ports": [{"port": port, "targetPort": port}]})
 
-    def api(self, path, body=None, token=None):
+    def api(self, path, body=None, token=None, *, method=None, expected_status=200):
         # Curl configuration on stdin keeps passwords and tokens out of arguments.
-        config = ['silent', 'show-error', 'fail',
+        self.redact_credentials([token])
+        method = method or ("POST" if body is not None else "GET")
+        config = ['silent', 'show-error', 'max-time = 20',
+                  "request = " + json.dumps(method), 'write-out = "\\n%{http_code}"',
                   "url = " + json.dumps(GRADIENT_URL + "/api/v1/" + path)]
         if token:
             config.append("header = " + json.dumps("Authorization: Bearer " + token))
@@ -132,8 +135,20 @@ class Fixture:
                            "data = " + json.dumps(json.dumps(body))])
         response = self.kubectl("exec", "-i", "deployment/postgres", "--",
                                "/bin/curl", "--config", "-", data="\n".join(config) + "\n")
-        result = json.loads(response)
-        if result.get("error"):
+        payload, separator, status = response.rpartition("\n")
+        if not separator or len(status) != 3 or not status.isascii() or not status.isdigit():
+            raise RuntimeError("Gradient API response missing HTTP status: " + path)
+        if int(status) != expected_status:
+            raise RuntimeError(
+                f"Gradient API {method} {path}: expected HTTP {expected_status}, got {status}"
+            )
+        if expected_status >= 400:
+            return None
+        try:
+            result = json.loads(payload)
+        except ValueError:
+            raise RuntimeError("Gradient API response is not JSON: " + path) from None
+        if not isinstance(result, dict) or result.get("error") or "message" not in result:
             raise RuntimeError("Gradient API request failed: " + path)
         return result["message"]
 
@@ -150,9 +165,96 @@ class Fixture:
         else:
             credential = self.api("user/keys", {
                 "name": "prepared-fixture", "expires_in_days": 1,
-                "permissions": ["viewProject", "manageWorkers"],
+                "team": "fixture", "permissions": ["manageWorkers"],
             }, session)
+            self.redact_credentials([credential])
+            self.validate_auth(session, credential)
         self.secret("driver-key", {"api-key": credential})
+
+    def validate_auth(self, session, worker_key):
+        team = "teams/fixture"
+        fleet = team + "/workers"
+        reads = (team, fleet + f"/demand?projects={PROJECT_ID}", fleet)
+        identity, demand, workers = [self.api(path, token=worker_key) for path in reads]
+        if (identity["name"] != "fixture"
+                or demand != {"builds": [], "network": 0, "secrets": 0, "eval": 0}
+                or workers != []):
+            raise RuntimeError("unexpected disposable team identity, demand or workers")
+        uuid.UUID(identity["id"])
+        denied = []
+        for name, permissions, pin in (
+                ("reader", ["viewProject"], {"team": "fixture"}),
+                ("unpinned", ["manageWorkers", "manageWebhooks"], {}),
+                ("project", ["manageWorkers", "manageWebhooks"], {"project": "fixture"}),
+                ("cache", ["readStore"], {"cache": "fixture"}),
+                ("webhooks", ["manageWebhooks"], {"team": "fixture"})):
+            key = self.api("user/keys", {
+                "name": "prepared-" + name, "expires_in_days": 1,
+                "permissions": permissions, **pin,
+            }, session)
+            self.redact_credentials([key])
+            denied.append((key, 403))
+        webhook_key = denied[-1][0]
+        worker_id = str(uuid.uuid4())
+        operations = [
+            *[("GET", path, None) for path in reads],
+            ("POST", fleet, {"worker_id": worker_id, "display_name": "Denied"}),
+        ]
+        for key, status in [*denied, (worker_key, 404)]:
+            for method, path, body in operations:
+                if status == 404:
+                    path = path.replace("teams/fixture", "teams/other", 1)
+                self.api(path, body, key, method=method, expected_status=status)
+        administration = [
+            ("GET", "teams", None),
+            *[("GET", team + "/" + path, None)
+              for path in ("members", "grants", "requests", "invitations")],
+            ("PUT", "teams", {"name": "denied", "display_name": "Denied"}),
+            ("PATCH", team, {"display_name": "Denied"}),
+            ("DELETE", team, None),
+        ]
+        for method, path, body in administration:
+            if method == "GET":
+                self.api(path, token=session)
+            for key in (worker_key, webhook_key):
+                self.api(path, body, key, method=method, expected_status=403)
+        self.validate_webhooks(webhook_key, [*denied[:-1], (worker_key, 403)])
+        print("PASS: team-pinned API-key auth, fleet denials and session-only administration")
+
+    def validate_webhooks(self, key, denied):
+        path = "teams/fixture/webhooks"
+        # Provisioning only: an inactive hook must never send traffic outside the fixture.
+        body = {"name": "prepared-fixture", "url": "https://fixture.example.invalid/gradient",
+                "events": ["worker.*"], "active": False}
+        created = self.api(path, body, key)
+        secret = created["secret"]
+        self.redact_credentials([secret])
+        hook = created["webhook"]
+        item = path + "/" + str(uuid.UUID(hook["id"]))
+        if any(hook[field] != value for field, value in body.items()):
+            raise RuntimeError("created webhook differs from the inactive fixture request")
+        for denied_key, status in [*denied, (key, 404)]:
+            for method, route, payload in (
+                    ("GET", path, None), ("POST", path, body)):
+                if status == 404:
+                    route = route.replace("teams/fixture", "teams/other", 1)
+                self.api(route, payload, denied_key, method=method, expected_status=status)
+        if self.api(path, token=key) != [hook] or self.api(item, token=key) != hook:
+            raise RuntimeError("webhook listing or read differs from creation")
+        if "secret" in hook:
+            raise RuntimeError("webhook read exposed its signing secret")
+        updated = self.api(item, {"name": "prepared-updated"}, key, method="PATCH")
+        if updated["name"] != "prepared-updated" or updated["active"] is not False:
+            raise RuntimeError("webhook update lost its name or inactive state")
+        rotated = self.api(item + "/rotate-secret", token=key, method="POST")["secret"]
+        self.redact_credentials([rotated])
+        if not secret.startswith("whs_") or not rotated.startswith("whs_") or rotated == secret:
+            raise RuntimeError("webhook rotation did not issue a new signing secret")
+        self.api(item, token=key, method="DELETE")
+        if self.api(path, token=key) != []:
+            raise RuntimeError("deleted webhook remains listed")
+        self.api(item, token=key, expected_status=404)
+        print("PASS: native team webhook create/list/read/update/rotate/delete (no delivery)")
 
     def bootstrap(self):
         password, pg_password = secrets.token_urlsafe(24), secrets.token_urlsafe(32)
@@ -210,6 +312,8 @@ exec postgres -D /data/pg -h 0.0.0.0 -k /data \
                                   "signing_key_file": "mounted", "projects": ["fixture"],
                                   "upstream_caches": []}},
         }
+        if self.args.auth == "api-key":
+            state["teams"]["other"] = {"name": "other", "display_name": "Other", "members": []}
         self.apply("ConfigMap", "server-state", data={"state.json": json.dumps(state)})
         self.deploy("gradient", {
             "command": ["/bin/gradient-server", "--database-url-file", "/credentials/database-url",
