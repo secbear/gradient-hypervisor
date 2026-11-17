@@ -2,6 +2,7 @@ use crate::config::Kubernetes;
 use crate::rest::{http_client, http_client_trusting, send, status_of};
 use anyhow::Context;
 use k8s_openapi::api::core::v1::{PodSpec, Secret};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use reqwest::{Client, Method, RequestBuilder, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
@@ -35,6 +36,8 @@ pub struct ObjectMeta {
     pub uid: String,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    #[serde(default, rename = "deletionTimestamp")]
+    pub deletion_timestamp: Option<Time>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

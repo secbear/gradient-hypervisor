@@ -1285,14 +1285,26 @@ async fn api_server_path_prefix_is_kept() {
     std::io::Write::write_all(&mut token, b"t").unwrap();
     let api = Url::parse(&format!("{}/k8s/clusters/c-1/", server.uri())).unwrap();
     let client = KubernetesClient::with_api_url(api, token.path().to_owned(), "ci");
-    Mock::given(method("GET"))
-        .and(path("/k8s/clusters/c-1/api/v1/namespaces/ci/pods/p"))
-        .respond_with(pod("p", "Running", None))
-        .expect(1)
-        .mount(&server)
-        .await;
+    for (name, deletion_timestamp) in [("p", None), ("terminating", Some("2026-11-17T00:00:00Z"))] {
+        let mut body = json!({"metadata": {"name": name, "uid": "uid-1"}});
+        if let Some(timestamp) = deletion_timestamp {
+            body["metadata"]["deletionTimestamp"] = json!(timestamp);
+        }
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/k8s/clusters/c-1/api/v1/namespaces/ci/pods/{name}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
 
-    assert!(client.pod("p").await.unwrap().is_some());
+        let pod = client.pod(name).await.unwrap().unwrap();
+        assert_eq!(
+            pod.metadata.deletion_timestamp.is_some(),
+            deletion_timestamp.is_some()
+        );
+    }
 }
 
 #[tokio::test]

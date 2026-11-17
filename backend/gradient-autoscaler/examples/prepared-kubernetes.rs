@@ -5,6 +5,7 @@ use gradient_autoscaler::capacity::{
     BuildCapacityProfile, CapacityAssessmentRequest, CapacityProfileRequest,
 };
 use gradient_autoscaler::config::{Config, LauncherConfig};
+use gradient_autoscaler::events::delete_worker;
 use gradient_autoscaler::gradient::GradientClient;
 use gradient_autoscaler::kubernetes::KubernetesLauncher;
 use gradient_autoscaler::kubernetes::client::KubernetesClient;
@@ -12,9 +13,11 @@ use gradient_autoscaler::kubernetes::pod::CONNECTION_LABEL;
 use gradient_autoscaler::launcher::Launcher;
 use gradient_autoscaler::service::ConnectionService;
 use gradient_autoscaler::state::{BuildLaunchIntent, Launch, LaunchState, State};
+use k8s_openapi::api::core::v1::{Container, Pod as NativePod, PodSpec, Secret};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration as StdDuration, Instant};
@@ -353,8 +356,79 @@ async fn main() -> anyhow::Result<()> {
                 "cleanup target differs from the saved worker"
             );
             connected_worker(&svc, &profile).await?;
-            svc.launcher.cancel(&saved).await?;
             let client = &kubernetes(&svc)?.client;
+            // Same-team and same-connection controls expose overly broad cleanup.
+            let control_id = Uuid::new_v4();
+            let control_name = format!("gradient-cleanup-control-{control_id}");
+            let control_caps = svc.conn.worker_capabilities;
+            svc.gradient
+                .register_team_worker_with_capabilities(
+                    &svc.conn.team,
+                    control_id,
+                    &control_name,
+                    control_caps,
+                )
+                .await?;
+            let control_pod = NativePod {
+                metadata: ObjectMeta {
+                    name: Some(control_name.clone()),
+                    labels: Some(BTreeMap::from([
+                        (CONNECTION_LABEL.into(), svc.conn.name.clone()),
+                        (
+                            "app.kubernetes.io/managed-by".into(),
+                            "gradient-autoscaler".into(),
+                        ),
+                    ])),
+                    ..Default::default()
+                },
+                spec: Some(PodSpec {
+                    automount_service_account_token: Some(false),
+                    // An unmatched selector keeps this control from starting a workload.
+                    node_selector: Some(BTreeMap::from([(
+                        "gradient.wavelens.io/cleanup-control".into(),
+                        control_name.clone(),
+                    )])),
+                    restart_policy: Some("Never".into()),
+                    containers: vec![Container {
+                        name: "control".into(),
+                        image: Some("gradient-kubernetes-test:fixture".into()),
+                        image_pull_policy: Some("Never".into()),
+                        command: Some(vec!["/bin/true".into()]),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let control_pod = client
+                .create_pod(&serde_json::to_value(control_pod)?)
+                .await?;
+            let control_secret = Secret {
+                metadata: ObjectMeta {
+                    name: Some(control_name.clone()),
+                    labels: Some(control_pod.metadata.labels.clone()),
+                    owner_references: Some(vec![OwnerReference {
+                        api_version: "v1".into(),
+                        kind: "Pod".into(),
+                        name: control_name.clone(),
+                        uid: control_pod.metadata.uid.clone(),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                },
+                immutable: Some(true),
+                type_: Some("Opaque".into()),
+                string_data: Some(BTreeMap::from([("control".into(), "unrelated".into())])),
+                ..Default::default()
+            };
+            client
+                .create_secret(&serde_json::to_value(control_secret)?)
+                .await?;
+            let control_secret = client
+                .secret(&control_name)
+                .await?
+                .context("cleanup control Secret is missing")?;
+            svc.launcher.cancel(&saved).await?;
             let deadline = Instant::now() + StdDuration::from_secs(60);
             loop {
                 if client.pod(&saved.external_id).await?.is_none()
@@ -368,12 +442,31 @@ async fn main() -> anyhow::Result<()> {
                 );
                 tokio::time::sleep(StdDuration::from_millis(500)).await;
             }
-            svc.gradient
-                .delete_team_worker(&svc.conn.team, profile.worker_id)
-                .await?;
+            delete_worker(&svc, &saved).await?;
+            let workers = svc.gradient.team_workers(&svc.conn.team).await?;
             ensure!(
-                svc.gradient.team_workers(&svc.conn.team).await?.is_empty(),
-                "cleanup left a worker registration"
+                workers.len() == 1
+                    && workers[0].worker_id == control_id.to_string()
+                    && workers[0].registration_matches(&control_name, control_caps),
+                "cleanup left the prepared worker or changed the unrelated registration"
+            );
+            let surviving_pod = client
+                .pod(&control_name)
+                .await?
+                .context("cleanup deleted the unrelated Pod")?;
+            let surviving_secret = client
+                .secret(&control_name)
+                .await?
+                .context("cleanup deleted the unrelated Secret")?;
+            ensure!(
+                surviving_pod.metadata.uid == control_pod.metadata.uid
+                    && surviving_pod.metadata.deletion_timestamp.is_none()
+                    && surviving_secret.metadata.uid == control_secret.metadata.uid
+                    && surviving_secret.metadata.deletion_timestamp.is_none()
+                    && surviving_secret.data == control_secret.data
+                    && surviving_secret.metadata.owner_references
+                        == control_secret.metadata.owner_references,
+                "cleanup replaced or changed the unrelated Pod or Secret"
             );
             ensure!(
                 svc.state
@@ -381,7 +474,9 @@ async fn main() -> anyhow::Result<()> {
                     .await?,
                 "cleanup did not close the saved launch"
             );
-            println!("PASS: scoped Pod deletion, credential garbage collection and unregistration");
+            println!(
+                "PASS: scoped Pod deletion, credential garbage collection and unregistration preserve unrelated resources"
+            );
         }
     }
     Ok(())

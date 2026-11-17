@@ -69,7 +69,7 @@ class FixtureGuards(unittest.TestCase):
                     subject.driver_credential("temporary-session")
             secret.assert_not_called()
 
-    def test_only_api_key_mode_adds_an_empty_mismatched_team(self):
+    def test_only_api_key_mode_adds_a_second_team_with_the_same_admin(self):
         for mode in ("api-key", "session"):
             with self.subTest(mode=mode):
                 subject = fixture()
@@ -84,7 +84,10 @@ class FixtureGuards(unittest.TestCase):
                 state = json.loads(apply.call_args.kwargs["data"]["state.json"])
                 if mode == "api-key":
                     self.assertEqual(state["teams"]["other"],
-                                     {"name": "other", "display_name": "Other", "members": []})
+                                     {"name": "other", "display_name": "Other",
+                                      "members": [{"user": "fixture", "role": "Admin"}]})
+                    self.assertEqual(state["teams"]["fixture"]["members"],
+                                     state["teams"]["other"]["members"])
                 else:
                     self.assertEqual(set(state["teams"]), {"fixture"})
 
@@ -216,6 +219,14 @@ class FixtureGuards(unittest.TestCase):
                 patch.object(subject, "validate_webhooks") as webhooks, patch("builtins.print"):
             subject.validate_auth("session", "worker-key")
         calls = api.call_args_list
+        controls = [
+            call(path, token="session")
+            for name in ("fixture", "other")
+            for path in (f"teams/{name}", f"teams/{name}/workers",
+                         f"teams/{name}/workers/demand?projects={PROJECT_ID}",
+                         f"teams/{name}/webhooks")
+        ]
+        self.assertEqual(calls[:len(controls)], controls)
         for name, permissions, pin in (
                 ("reader", ["viewProject"], {"team": "fixture"}),
                 ("unpinned", ["manageWorkers", "manageWebhooks"], {}),
@@ -250,6 +261,24 @@ class FixtureGuards(unittest.TestCase):
             ("prepared-reader", 403), ("prepared-unpinned", 403),
             ("prepared-project", 403), ("prepared-cache", 403), ("worker-key", 403),
         ])
+
+    def test_failed_session_control_prevents_cross_team_denials(self):
+        subject = fixture()
+
+        def response(path, **kwargs):
+            if path == "teams/other/webhooks":
+                raise RuntimeError("session control failed")
+            return None
+
+        with patch.object(subject, "api", side_effect=response) as api, \
+                patch.object(subject, "validate_webhooks") as webhooks, patch("builtins.print") as output:
+            with self.assertRaisesRegex(RuntimeError, "session control failed"):
+                subject.validate_auth("session", "worker-key")
+        self.assertEqual(len(api.call_args_list), 8)
+        self.assertTrue(all(request.kwargs == {"token": "session"}
+                            for request in api.call_args_list))
+        webhooks.assert_not_called()
+        output.assert_not_called()
 
     def test_native_webhook_lifecycle_stays_inactive_and_redacts_rotated_secrets(self):
         path = "teams/fixture/webhooks"

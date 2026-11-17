@@ -172,6 +172,12 @@ class Fixture:
         self.secret("driver-key", {"api-key": credential})
 
     def validate_auth(self, session, worker_key):
+        # Both teams must be accessible without a key pin before testing cross-team denials.
+        for name in ("fixture", "other"):
+            for path in (f"teams/{name}", f"teams/{name}/workers",
+                         f"teams/{name}/workers/demand?projects={PROJECT_ID}",
+                         f"teams/{name}/webhooks"):
+                self.api(path, token=session)
         team = "teams/fixture"
         fleet = team + "/workers"
         reads = (team, fleet + f"/demand?projects={PROJECT_ID}", fleet)
@@ -313,7 +319,10 @@ exec postgres -D /data/pg -h 0.0.0.0 -k /data \
                                   "upstream_caches": []}},
         }
         if self.args.auth == "api-key":
-            state["teams"]["other"] = {"name": "other", "display_name": "Other", "members": []}
+            state["teams"]["other"] = {
+                "name": "other", "display_name": "Other",
+                "members": [{"user": "fixture", "role": "Admin"}],
+            }
         self.apply("ConfigMap", "server-state", data={"state.json": json.dumps(state)})
         self.deploy("gradient", {
             "command": ["/bin/gradient-server", "--database-url-file", "/credentials/database-url",
