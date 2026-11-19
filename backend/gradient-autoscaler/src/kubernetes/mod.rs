@@ -176,15 +176,30 @@ impl KubernetesLauncher {
     }
 
     async fn remove_leftover_pods(&self, svc: &ConnectionService) -> anyhow::Result<()> {
-        let open: HashSet<String> = svc
+        let launches = svc.state.open_launches(&svc.conn.name).await?;
+        // Reserved names remain protected across connections and API aliases.
+        let prepared: HashSet<String> = svc
             .state
-            .open_launches(&svc.conn.name)
+            .open_prepared_launches()
             .await?
             .into_iter()
+            .filter(|launch| {
+                launch
+                    .build_intent
+                    .as_ref()
+                    .is_some_and(|intent| intent.kubernetes.is_some())
+            })
+            .map(|launch| launch.external_id)
+            .collect();
+        let open: HashSet<String> = launches
+            .iter()
             .map(|launch| launch.id.to_string())
             .collect();
         let selector = format!("{CONNECTION_LABEL}={}", svc.conn.name);
         for pod in self.client.pods(&selector).await? {
+            if prepared.contains(pod.metadata.name.as_str()) {
+                continue;
+            }
             let launch = pod.metadata.labels.get(LAUNCH_LABEL);
             if launch.is_none_or(|launch| !open.contains(launch)) {
                 self.client.delete_pod(&pod.metadata.name).await?;

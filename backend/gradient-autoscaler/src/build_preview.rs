@@ -72,6 +72,7 @@ pub async fn preview_build_capacity(svc: &ConnectionService) -> anyhow::Result<B
     }
     for launch in &open {
         if let Some(intent) = &launch.build_intent
+            && launch.cleanup_outcome.is_none()
             && launch.registration_started
             && launch.state < LaunchState::Connected
             && launch.dispatched_at <= now

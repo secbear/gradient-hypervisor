@@ -35,6 +35,7 @@ pub struct Launch {
     pub swapped: bool,
     pub dispatched_at: OffsetDateTime,
     pub build_intent: Option<BuildLaunchIntent>,
+    pub cleanup_outcome: Option<LaunchState>,
     pub registration_started: bool,
     pub secret_uid: Option<String>,
     pub pod_uid: Option<String>,
@@ -143,6 +144,7 @@ impl Launch {
             swapped: false,
             dispatched_at: OffsetDateTime::now_utc(),
             build_intent: None,
+            cleanup_outcome: None,
             registration_started: false,
             secret_uid: None,
             pod_uid: None,
@@ -152,6 +154,7 @@ impl Launch {
     fn from_row(row: &SqliteRow) -> anyhow::Result<Launch> {
         let worker_id: Option<String> = row.try_get("worker_id")?;
         let raw: Option<String> = row.try_get("build_intent")?;
+        let cleanup_outcome: Option<String> = row.try_get("cleanup_outcome")?;
         let launch = Launch {
             id: row.try_get::<String, _>("id")?.parse()?,
             connection: row.try_get("connection")?,
@@ -162,14 +165,26 @@ impl Launch {
             swapped: row.try_get("swapped")?,
             dispatched_at: OffsetDateTime::from_unix_timestamp(row.try_get("dispatched_at")?)?,
             build_intent: raw.map(|raw| serde_json::from_str(&raw)).transpose()?,
+            cleanup_outcome: cleanup_outcome.map(|outcome| outcome.parse()).transpose()?,
             registration_started: row.try_get("registration_started")?,
             secret_uid: row.try_get("secret_uid")?,
             pod_uid: row.try_get("pod_uid")?,
         };
-        if let Some(intent) = &launch.build_intent {
-            intent.validate(&launch)?;
-        }
+        launch.validate()?;
         Ok(launch)
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        if let Some(intent) = &self.build_intent {
+            intent.validate(self)?;
+        }
+        if let Some(outcome) = self.cleanup_outcome {
+            ensure!(
+                self.build_intent.is_some() && !outcome.is_open(),
+                "build cleanup requires a prepared launch and a terminal outcome"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -204,12 +219,10 @@ impl State {
     }
 
     pub async fn insert_launch(&self, launch: &Launch) -> anyhow::Result<()> {
-        if let Some(intent) = &launch.build_intent {
-            intent.validate(launch)?;
-        }
+        launch.validate()?;
         sqlx::query(
-            "INSERT INTO launch (id, connection, external_id, label, state, worker_id, swapped, dispatched_at, updated_at, build_intent, registration_started, secret_uid, pod_uid)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO launch (id, connection, external_id, label, state, worker_id, swapped, dispatched_at, updated_at, build_intent, cleanup_outcome, registration_started, secret_uid, pod_uid)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(launch.id.to_string())
         .bind(&launch.connection)
@@ -221,6 +234,7 @@ impl State {
         .bind(launch.dispatched_at.unix_timestamp())
         .bind(now())
         .bind(launch.build_intent.as_ref().map(serde_json::to_string).transpose()?)
+        .bind(launch.cleanup_outcome.map(LaunchState::as_str))
         .bind(launch.registration_started)
         .bind(&launch.secret_uid)
         .bind(&launch.pod_uid)
@@ -233,7 +247,8 @@ impl State {
         Ok(sqlx::query(
             "UPDATE launch SET registration_started = 1, updated_at = ?
              WHERE id = ? AND connection = ? AND build_intent IS NOT NULL
-             AND registration_started = 0 AND state IN (?, ?, ?, ?)",
+             AND cleanup_outcome IS NULL AND registration_started = 0
+             AND state IN (?, ?, ?, ?)",
         )
         .bind(now())
         .bind(launch.id.to_string())
@@ -246,6 +261,41 @@ impl State {
         .await?
         .rows_affected()
             == 1)
+    }
+
+    pub async fn begin_build_cleanup(
+        &self,
+        launch: &Launch,
+        outcome: LaunchState,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            launch.build_intent.is_some() && launch.state.is_open(),
+            "build cleanup requires an open prepared launch"
+        );
+        ensure!(!outcome.is_open(), "build cleanup outcome must be terminal");
+        let updated = sqlx::query(
+            "UPDATE launch SET cleanup_outcome = ?, updated_at = ?
+             WHERE id = ? AND connection = ? AND build_intent IS NOT NULL
+             AND (cleanup_outcome IS NULL OR cleanup_outcome = ?)
+             AND state IN (?, ?, ?, ?)",
+        )
+        .bind(outcome.as_str())
+        .bind(now())
+        .bind(launch.id.to_string())
+        .bind(&launch.connection)
+        .bind(outcome.as_str())
+        .bind(OPEN_STATES[0].as_str())
+        .bind(OPEN_STATES[1].as_str())
+        .bind(OPEN_STATES[2].as_str())
+        .bind(OPEN_STATES[3].as_str())
+        .execute(&self.0)
+        .await?
+        .rows_affected();
+        ensure!(
+            updated == 1,
+            "build cleanup outcome changed or launch is not open in this connection"
+        );
+        Ok(())
     }
 
     pub async fn bind_build_objects(
@@ -314,6 +364,20 @@ impl State {
             "SELECT * FROM launch WHERE connection = ? AND state IN (?, ?, ?, ?) ORDER BY dispatched_at",
         )
         .bind(connection)
+        .bind(OPEN_STATES[0].as_str())
+        .bind(OPEN_STATES[1].as_str())
+        .bind(OPEN_STATES[2].as_str())
+        .bind(OPEN_STATES[3].as_str())
+        .fetch_all(&self.0)
+        .await?;
+        rows.iter().map(Launch::from_row).collect()
+    }
+
+    pub async fn open_prepared_launches(&self) -> anyhow::Result<Vec<Launch>> {
+        let rows = sqlx::query(
+            "SELECT * FROM launch WHERE build_intent IS NOT NULL
+             AND state IN (?, ?, ?, ?) ORDER BY dispatched_at",
+        )
         .bind(OPEN_STATES[0].as_str())
         .bind(OPEN_STATES[1].as_str())
         .bind(OPEN_STATES[2].as_str())
@@ -566,6 +630,214 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_cleanup_survives_restart_and_keeps_launch_open_until_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite");
+        let launch = Launch {
+            state: LaunchState::Connected,
+            ..prepared_launch("a", "1")
+        };
+        let state = State::open(&path).await.unwrap();
+        state.insert_launch(&launch).await.unwrap();
+        let mut expected = state.launch("a", launch.id).await.unwrap().unwrap();
+        assert_eq!(expected.cleanup_outcome, None);
+        state
+            .begin_build_cleanup(&launch, LaunchState::Failed)
+            .await
+            .unwrap();
+        expected.cleanup_outcome = Some(LaunchState::Failed);
+        state.0.close().await;
+
+        let restored = State::open(&path).await.unwrap();
+        let open = restored.open_launches("a").await.unwrap();
+        assert_eq!(open, [expected.clone()]);
+        restored
+            .begin_build_cleanup(&open[0], LaunchState::Failed)
+            .await
+            .unwrap();
+        assert!(
+            restored
+                .close_launch(launch.id, LaunchState::Failed)
+                .await
+                .unwrap()
+        );
+        let open = restored.open_launches("a").await.unwrap();
+        assert!(open.is_empty());
+        expected.state = LaunchState::Failed;
+        assert_eq!(
+            restored.launch("a", launch.id).await.unwrap().unwrap(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn build_cleanup_outcome_is_idempotent_and_immutable() {
+        let state = State::memory().await.unwrap();
+        let outcomes = [
+            LaunchState::Completed,
+            LaunchState::Failed,
+            LaunchState::Cancelled,
+        ];
+        for outcome in outcomes {
+            let launch = prepared_launch("a", outcome.as_str());
+            state.insert_launch(&launch).await.unwrap();
+            state.begin_build_cleanup(&launch, outcome).await.unwrap();
+            state.begin_build_cleanup(&launch, outcome).await.unwrap();
+            for different in outcomes.into_iter().filter(|other| *other != outcome) {
+                assert!(state.begin_build_cleanup(&launch, different).await.is_err());
+            }
+            sqlx::query("UPDATE launch SET cleanup_outcome = ? WHERE id = ?")
+                .bind(outcome.as_str())
+                .bind(launch.id.to_string())
+                .execute(&state.0)
+                .await
+                .unwrap();
+            for value in [None, Some("completed"), Some("failed"), Some("cancelled")]
+                .into_iter()
+                .filter(|value| *value != Some(outcome.as_str()))
+            {
+                assert!(
+                    sqlx::query("UPDATE launch SET cleanup_outcome = ? WHERE id = ?")
+                        .bind(value)
+                        .bind(launch.id.to_string())
+                        .execute(&state.0)
+                        .await
+                        .is_err()
+                );
+            }
+            let saved = state.launch("a", launch.id).await.unwrap().unwrap();
+            assert_eq!(saved.cleanup_outcome, Some(outcome));
+            assert_eq!(saved.state, launch.state);
+            assert!(state.close_launch(launch.id, outcome).await.unwrap());
+            assert!(
+                sqlx::query("UPDATE launch SET cleanup_outcome = NULL WHERE id = ?")
+                    .bind(launch.id.to_string())
+                    .execute(&state.0)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn build_cleanup_rejects_invalid_outcomes_and_unscoped_or_legacy_launches() {
+        let state = State::memory().await.unwrap();
+        let launch = prepared_launch("a", "1");
+        state.insert_launch(&launch).await.unwrap();
+        for outcome in OPEN_STATES {
+            assert!(state.begin_build_cleanup(&launch, outcome).await.is_err());
+            let invalid = Launch {
+                cleanup_outcome: Some(outcome),
+                ..prepared_launch("a", outcome.as_str())
+            };
+            assert!(state.insert_launch(&invalid).await.is_err());
+            assert!(
+                sqlx::query("UPDATE launch SET cleanup_outcome = ? WHERE id = ?")
+                    .bind(outcome.as_str())
+                    .bind(launch.id.to_string())
+                    .execute(&state.0)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            sqlx::query("UPDATE launch SET cleanup_outcome = 'unknown' WHERE id = ?")
+                .bind(launch.id.to_string())
+                .execute(&state.0)
+                .await
+                .is_err()
+        );
+        for unscoped in [
+            Launch {
+                connection: "b".into(),
+                ..launch.clone()
+            },
+            prepared_launch("a", "missing"),
+        ] {
+            assert!(
+                state
+                    .begin_build_cleanup(&unscoped, LaunchState::Failed)
+                    .await
+                    .is_err()
+            );
+        }
+        let legacy = Launch::new("a", "legacy", "builder");
+        state.insert_launch(&legacy).await.unwrap();
+        let invalid_legacy = Launch {
+            cleanup_outcome: Some(LaunchState::Failed),
+            ..Launch::new("a", "invalid-legacy", "builder")
+        };
+        assert!(state.insert_launch(&invalid_legacy).await.is_err());
+        for candidate in [
+            legacy.clone(),
+            Launch {
+                build_intent: launch.build_intent.clone(),
+                worker_id: launch.worker_id,
+                ..legacy.clone()
+            },
+        ] {
+            assert!(
+                state
+                    .begin_build_cleanup(&candidate, LaunchState::Failed)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            sqlx::query("UPDATE launch SET cleanup_outcome = 'failed' WHERE id = ?")
+                .bind(legacy.id.to_string())
+                .execute(&state.0)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            state
+                .launch("a", legacy.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .cleanup_outcome,
+            None
+        );
+        assert!(
+            state
+                .close_launch(launch.id, LaunchState::Completed)
+                .await
+                .unwrap()
+        );
+        let closed = state.launch("a", launch.id).await.unwrap().unwrap();
+        for candidate in [launch, closed] {
+            assert!(
+                state
+                    .begin_build_cleanup(&candidate, LaunchState::Failed)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn build_cleanup_prevents_fresh_registration_claims_in_every_open_state() {
+        let state = State::memory().await.unwrap();
+        for status in OPEN_STATES {
+            let launch = Launch {
+                state: status,
+                ..prepared_launch("a", status.as_str())
+            };
+            state.insert_launch(&launch).await.unwrap();
+            state
+                .begin_build_cleanup(&launch, LaunchState::Cancelled)
+                .await
+                .unwrap();
+            assert!(!state.claim_build_registration(&launch).await.unwrap());
+            let saved = state.launch("a", launch.id).await.unwrap().unwrap();
+            assert!(!saved.registration_started);
+            assert!(!state.claim_build_registration(&saved).await.unwrap());
+            assert_eq!(saved.cleanup_outcome, Some(LaunchState::Cancelled));
+        }
+    }
+
+    #[tokio::test]
     async fn build_intent_rejects_identity_collision_and_mutation() {
         let state = State::memory().await.unwrap();
         let launch = prepared_launch("a", "1");
@@ -669,8 +941,63 @@ mod tests {
         let saved = state.launch("a", legacy.id).await.unwrap().unwrap();
         assert_eq!(saved.state, LaunchState::Queued);
         assert!(saved.build_intent.is_none());
+        assert_eq!(saved.cleanup_outcome, None);
         assert!(!saved.registration_started);
         assert!(state.claim_cancel(saved.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn prepared_launch_rows_migrate_without_assumed_cleanup() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::from_str("sqlite::memory:").unwrap())
+            .await
+            .unwrap();
+        let mut previous = sqlx::migrate!("./migrations");
+        previous.migrations = std::borrow::Cow::Owned(
+            previous
+                .iter()
+                .filter(|migration| migration.version < 4)
+                .cloned()
+                .collect(),
+        );
+        previous.run(&pool).await.unwrap();
+        let launch = prepared_launch("a", "1");
+        sqlx::query(
+            "INSERT INTO launch (id, connection, external_id, label, state, worker_id, dispatched_at, updated_at, build_intent)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(launch.id.to_string())
+        .bind(&launch.connection)
+        .bind(&launch.external_id)
+        .bind(&launch.label)
+        .bind(launch.state.as_str())
+        .bind(launch.worker_id.unwrap().to_string())
+        .bind(launch.dispatched_at.unix_timestamp())
+        .bind(now())
+        .bind(serde_json::to_string(launch.build_intent.as_ref().unwrap()).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = State::migrated(pool).await.unwrap();
+        let saved = state.launch("a", launch.id).await.unwrap().unwrap();
+        assert_eq!(saved.cleanup_outcome, None);
+        assert_eq!(saved.build_intent, launch.build_intent);
+        assert!(state.claim_build_registration(&saved).await.unwrap());
+        let checkpointed = Launch {
+            cleanup_outcome: Some(LaunchState::Completed),
+            ..prepared_launch("a", "2")
+        };
+        state.insert_launch(&checkpointed).await.unwrap();
+        assert_eq!(
+            state
+                .launch("a", checkpointed.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .cleanup_outcome,
+            checkpointed.cleanup_outcome
+        );
     }
 
     #[tokio::test]

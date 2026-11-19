@@ -2,6 +2,7 @@ use crate::config::Kubernetes;
 use crate::rest::{http_client, http_client_trusting, send, status_of};
 use anyhow::Context;
 use k8s_openapi::api::core::v1::{PodSpec, Secret};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{DeleteOptions, Preconditions};
 use reqwest::{Client, Method, RequestBuilder, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
@@ -35,6 +36,8 @@ pub struct ObjectMeta {
     pub uid: String,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    #[serde(default, rename = "deletionTimestamp")]
+    pub deletion_timestamp: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -182,6 +185,32 @@ impl KubernetesClient {
 
     pub async fn delete_pod(&self, name: &str) -> anyhow::Result<()> {
         let request = self.request(Method::DELETE, &format!("pods/{name}"))?;
+        match send(&self.http, request).await {
+            Err(error) if status_of(&error) != Some(StatusCode::NOT_FOUND) => Err(error),
+            _ => Ok(()),
+        }
+    }
+
+    pub async fn delete_pod_with_uid(&self, name: &str, uid: &str) -> anyhow::Result<()> {
+        self.delete_with_uid("pods", name, uid).await
+    }
+
+    pub async fn delete_secret_with_uid(&self, name: &str, uid: &str) -> anyhow::Result<()> {
+        self.delete_with_uid("secrets", name, uid).await
+    }
+
+    async fn delete_with_uid(&self, resource: &str, name: &str, uid: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(!uid.is_empty(), "cannot delete an object without its UID");
+        let options = DeleteOptions {
+            preconditions: Some(Preconditions {
+                uid: Some(uid.to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let request = self
+            .request(Method::DELETE, &format!("{resource}/{name}"))?
+            .json(&options);
         match send(&self.http, request).await {
             Err(error) if status_of(&error) != Some(StatusCode::NOT_FOUND) => Err(error),
             _ => Ok(()),

@@ -86,7 +86,11 @@ pub async fn record_connected_workers(svc: &ConnectionService) -> anyhow::Result
         .open_launches(&svc.conn.name)
         .await?
         .into_iter()
-        .filter(|launch| launch.worker_id.is_some() && launch.state < LaunchState::Connected)
+        .filter(|launch| {
+            launch.worker_id.is_some()
+                && launch.state < LaunchState::Connected
+                && launch.build_intent.is_none()
+        })
         .collect();
     if waiting.is_empty() {
         return Ok(());
@@ -106,19 +110,13 @@ pub async fn record_connected_workers(svc: &ConnectionService) -> anyhow::Result
                 max_jobs: live.max_concurrent_builds,
                 ram_mb: live.ram_total_mb,
             };
-            if launch.build_intent.is_none() {
-                svc.state
-                    .put_profile(&svc.conn.name, &launch.label, &profile)
-                    .await?;
-            }
+            svc.state
+                .put_profile(&svc.conn.name, &launch.label, &profile)
+                .await?;
             svc.state
                 .advance_launch(launch.id, LaunchState::Connected)
                 .await?;
-            if launch.build_intent.is_none() {
-                tracing::info!(connection = %svc.conn.name, label = %launch.label, ?profile, "worker connected; profile learned");
-            } else {
-                tracing::info!(connection = %svc.conn.name, launch_id = %launch.id, "prepared worker connected");
-            }
+            tracing::info!(connection = %svc.conn.name, label = %launch.label, ?profile, "worker connected; profile learned");
         }
     }
 

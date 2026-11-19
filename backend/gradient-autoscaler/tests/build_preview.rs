@@ -356,6 +356,31 @@ async fn preview_credits_only_fresh_registered_intents_and_keeps_all_open_launch
         vec![fresh.worker_id.unwrap()]
     );
     assert!(preview.plan.deferred_builds.is_empty());
+    fixture
+        .svc
+        .state
+        .begin_build_cleanup(&fresh, LaunchState::Failed)
+        .await
+        .unwrap();
+    let cleaning = fixture.svc.state.open_launches("ops").await.unwrap();
+    server.reset().await;
+    assessment(&server, 3, false).await;
+    let preview = preview_build_capacity(&fixture.svc).await.unwrap();
+    assert!(preview.tracked_workers.is_empty());
+    assert!(preview.plan.credited_starting_workers.is_empty());
+    assert!(preview.plan.proposed_workers.is_empty());
+    assert_eq!(preview.plan.deferred_builds.len(), 3);
+    assert!(
+        preview
+            .plan
+            .deferred_builds
+            .iter()
+            .all(|build| { build.reason == BuildWaitReason::LaunchLimit })
+    );
+    assert_eq!(
+        fixture.svc.state.open_launches("ops").await.unwrap(),
+        cleaning
+    );
 }
 
 #[tokio::test]
@@ -384,6 +409,14 @@ async fn preview_catch_up_and_direct_mutation_entries_leave_state_and_external_s
             .svc
             .launcher
             .launch(&fixture.svc, &[&kinds[0]])
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .svc
+            .launcher
+            .reconcile_prepared(&fixture.svc, launch.id)
             .await
             .is_err()
     );

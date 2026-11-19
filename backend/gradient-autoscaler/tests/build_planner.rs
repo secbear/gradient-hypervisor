@@ -327,14 +327,16 @@ fn waiting_build_credit_belongs_to_its_one_scoped_build() {
 
 #[test]
 fn starting_capacity_is_credited_once_only_before_connection_and_expiry() {
-    for (connected, age, expected) in [
-        (false, 30, 0),
-        (false, 120, 1),
-        (false, -1, 1),
-        (true, 30, 1),
+    for (connected, age, cleanup, expected) in [
+        (false, 30, None, 0),
+        (false, 120, None, 1),
+        (false, -1, None, 1),
+        (true, 30, None, 1),
+        (false, 30, Some(LaunchState::Failed), 1),
     ] {
         let mut case = Case::new(vec![profile("small", 4_000, 2)], 2, Some(1_000));
         case.starting(connected, None, Duration::seconds(age));
+        case.open[0].cleanup_outcome = cleanup;
         let plan = case.plan();
         assert_eq!(plan.proposed_workers.len(), expected);
         assert_eq!(
@@ -449,6 +451,11 @@ fn open_launches_occupy_global_and_kind_limits_even_after_startup_expiry() {
         }
         let plan = case.plan();
         assert!(plan.proposed_workers.is_empty());
+        assert_eq!(plan.deferred_builds[0].reason, BuildWaitReason::LaunchLimit);
+        case.open[0].cleanup_outcome = Some(LaunchState::Failed);
+        let plan = case.plan();
+        assert!(plan.proposed_workers.is_empty());
+        assert!(plan.credited_starting_workers.is_empty());
         assert_eq!(plan.deferred_builds[0].reason, BuildWaitReason::LaunchLimit);
     }
 }

@@ -1,16 +1,17 @@
 use super::KubernetesLauncher;
-use super::client::Pod;
+use super::client::{KubernetesClient, Pod};
 use super::pod::{
     CONNECTION_LABEL, LAUNCH_LABEL, POOL_LABEL, PROFILE_ENVIRONMENT_ANNOTATION,
     PROFILE_ENVIRONMENT_VERSION, WorkerPod, capacity_environment, capacity_features_setting,
-    capacity_nix_config, pod_name,
+    capacity_nix_config, pod_name, progress_of,
 };
 use crate::build_planner::{BuildScalingPolicy, PlannedBuildWorker};
 use crate::capacity::BuildCapacityProfile;
-use crate::gradient::worker_server_url;
+use crate::gradient::{TeamWorker, worker_server_url};
+use crate::launcher::Progress;
 use crate::rest::status_of;
 use crate::service::ConnectionService;
-use crate::state::{BuildLaunchIntent, Launch};
+use crate::state::{BuildLaunchIntent, Launch, LaunchState};
 use anyhow::{Context, ensure};
 use base64::Engine as _;
 use k8s_openapi::api::core::v1::{Container, Pod as NativePod, PodSpec, Secret};
@@ -133,6 +134,66 @@ fn validate_profile_environment(
 }
 
 impl KubernetesLaunchSpec {
+    async fn validate_scope(
+        &self,
+        svc: &ConnectionService,
+        client: &KubernetesClient,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            self.gradient_url == *svc.gradient.base_url()
+                && self.team == svc.conn.team
+                && self.api_url == *client.api_url()
+                && self.namespace == client.namespace(),
+            "prepared launch belongs to a different server or Kubernetes target"
+        );
+        ensure!(
+            svc.gradient.team_id(&self.team).await? == self.team_id,
+            "prepared launch team identity changed"
+        );
+        Ok(())
+    }
+
+    fn validate_registration(&self, launch: &Launch, worker: &TeamWorker) -> anyhow::Result<()> {
+        let intent = launch
+            .build_intent
+            .as_ref()
+            .context("launch has no build intent")?;
+        ensure!(
+            launch.registration_started
+                && worker.registration_matches(
+                    &format!("k8s-{}-{}", launch.label, launch.id),
+                    intent.profile.registration_capabilities(),
+                ),
+            "worker registration differs from prepared launch"
+        );
+        Ok(())
+    }
+
+    fn validate_secret_owner(
+        &self,
+        secret: &Secret,
+        launch: &Launch,
+        pod: Option<&Pod>,
+    ) -> anyhow::Result<()> {
+        if let Some(owners) = &secret.metadata.owner_references
+            && !owners.is_empty()
+        {
+            let uid = pod
+                .map(|pod| pod.metadata.uid.as_str())
+                .or(launch.pod_uid.as_deref())
+                .context("owned secret has no observed pod identity")?;
+            ensure!(
+                owners.len() == 1
+                    && owners[0].api_version == "v1"
+                    && owners[0].kind == "Pod"
+                    && owners[0].name == launch.external_id
+                    && owners[0].uid == uid,
+                "prepared secret has a different pod owner"
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate(
         &self,
         launch: &Launch,
@@ -291,6 +352,182 @@ impl KubernetesLaunchSpec {
 }
 
 impl KubernetesLauncher {
+    pub async fn reconcile_prepared(
+        &self,
+        svc: &ConnectionService,
+        launch_id: Uuid,
+    ) -> anyhow::Result<()> {
+        svc.ensure_mutations_allowed()?;
+        let mut launch = svc
+            .state
+            .launch(&svc.conn.name, launch_id)
+            .await?
+            .context("prepared launch does not belong to this connection")?;
+        if !launch.state.is_open() {
+            return Ok(());
+        }
+        let intent = launch
+            .build_intent
+            .as_ref()
+            .context("launch has no build intent")?;
+        let spec = intent
+            .kubernetes
+            .as_ref()
+            .context("launch has no Kubernetes specification")?;
+        spec.validate_scope(svc, &self.client).await?;
+        if let Some(outcome) = launch.cleanup_outcome {
+            return self.finish_prepared(svc, &launch, outcome).await;
+        }
+        let pod = self.client.pod(&launch.external_id).await?;
+        if let Some(pod) = &pod {
+            spec.owned_pod(pod, &launch, &intent.profile)?;
+            ensure!(
+                launch.registration_started,
+                "pod exists before prepared registration started"
+            );
+        }
+        let workers = svc.gradient.team_workers(&spec.team).await?;
+        if let Some(worker) = workers
+            .iter()
+            .find(|worker| worker.worker_id == intent.profile.worker_id.to_string())
+        {
+            spec.validate_registration(&launch, worker)?;
+            if worker.connected {
+                ensure!(
+                    pod.is_some() || launch.pod_uid.is_some(),
+                    "connected worker has no owned prepared pod"
+                );
+                if pod.is_some() {
+                    svc.state
+                        .advance_launch(launch.id, LaunchState::Connected)
+                        .await?;
+                    launch.state = LaunchState::Connected;
+                }
+            }
+        }
+        let ended = pod.as_ref().is_some_and(|pod| {
+            pod.metadata.deletion_timestamp.is_some() || progress_of(Some(pod)) == Progress::Ended
+        });
+        let lost =
+            pod.is_none() && (launch.pod_uid.is_some() || launch.state == LaunchState::Connected);
+        let expired = launch.state != LaunchState::Connected
+            && OffsetDateTime::now_utc() >= intent.startup_deadline;
+        if ended || lost || expired {
+            let succeeded = pod.as_ref().is_some_and(|pod| {
+                pod.status
+                    .as_ref()
+                    .and_then(|status| status.phase.as_deref())
+                    == Some("Succeeded")
+            });
+            let outcome = if succeeded && launch.state == LaunchState::Connected {
+                LaunchState::Completed
+            } else {
+                LaunchState::Failed
+            };
+            return self.finish_prepared(svc, &launch, outcome).await;
+        }
+        self.launch_prepared(svc, launch_id).await?;
+        let progress = progress_of(self.client.pod(&launch.external_id).await?.as_ref());
+        let state = match progress {
+            Progress::Running => LaunchState::Running,
+            Progress::Waiting => LaunchState::Queued,
+            Progress::Ended => return Ok(()),
+        };
+        svc.state.advance_launch(launch.id, state).await?;
+        Ok(())
+    }
+
+    async fn finish_prepared(
+        &self,
+        svc: &ConnectionService,
+        launch: &Launch,
+        outcome: LaunchState,
+    ) -> anyhow::Result<()> {
+        let intent = launch
+            .build_intent
+            .as_ref()
+            .context("launch has no build intent")?;
+        let spec = intent
+            .kubernetes
+            .as_ref()
+            .context("launch has no Kubernetes specification")?;
+        spec.validate_scope(svc, &self.client).await?;
+        svc.state.begin_build_cleanup(launch, outcome).await?;
+        let pod = self.client.pod(&launch.external_id).await?;
+        if let Some(pod) = &pod {
+            spec.owned_pod(pod, launch, &intent.profile)?;
+            ensure!(
+                launch.registration_started,
+                "pod exists before prepared registration started"
+            );
+        }
+        let secret = self.client.secret(&launch.external_id).await?;
+        if let Some(secret) = &secret {
+            spec.credential(secret, launch)?;
+            spec.validate_secret_owner(secret, launch, pod.as_ref())?;
+        }
+        let workers = svc.gradient.team_workers(&spec.team).await?;
+        let worker = workers
+            .iter()
+            .find(|worker| worker.worker_id == intent.profile.worker_id.to_string());
+        if let Some(worker) = worker {
+            spec.validate_registration(launch, worker)?;
+        }
+        if let Some(secret_uid) = secret
+            .as_ref()
+            .and_then(|secret| secret.metadata.uid.as_deref())
+            .or(launch.secret_uid.as_deref())
+        {
+            svc.state
+                .bind_build_objects(
+                    launch,
+                    secret_uid,
+                    pod.as_ref().map(|pod| pod.metadata.uid.as_str()),
+                )
+                .await?;
+        }
+        if let Some(pod) = pod {
+            self.client
+                .delete_pod_with_uid(&launch.external_id, &pod.metadata.uid)
+                .await?;
+            if self.client.pod(&launch.external_id).await?.is_some() {
+                return Ok(());
+            }
+        }
+        if let Some(secret) = secret {
+            self.client
+                .delete_secret_with_uid(
+                    &launch.external_id,
+                    secret
+                        .metadata
+                        .uid
+                        .as_deref()
+                        .context("credential secret has no UID")?,
+                )
+                .await?;
+            if self.client.secret(&launch.external_id).await?.is_some() {
+                return Ok(());
+            }
+        }
+        if worker.is_some() {
+            crate::events::delete_worker(svc, launch).await?;
+            ensure!(
+                !svc.gradient
+                    .team_workers(&spec.team)
+                    .await?
+                    .iter()
+                    .any(|worker| { worker.worker_id == intent.profile.worker_id.to_string() }),
+                "prepared worker registration is still present"
+            );
+        }
+        svc.state.close_launch(launch.id, outcome).await?;
+        tracing::info!(
+            connection = %svc.conn.name, launch_id = %launch.id, ?outcome,
+            "finished prepared worker launch"
+        );
+        Ok(())
+    }
+
     pub async fn prepare_build_launch(
         &self,
         svc: &ConnectionService,
@@ -399,22 +636,16 @@ impl KubernetesLauncher {
             .context("launch has no Kubernetes specification")?;
         ensure!(launch.state.is_open(), "prepared launch is closed");
         ensure!(
+            launch.cleanup_outcome.is_none(),
+            "prepared launch cleanup has started"
+        );
+        ensure!(
             svc.conn
                 .worker_capabilities
                 .permits(intent.profile.registration_capabilities()),
             "prepared profile exceeds current connection permissions"
         );
-        ensure!(
-            spec.gradient_url == *svc.gradient.base_url()
-                && spec.team == svc.conn.team
-                && spec.api_url == *self.client.api_url()
-                && spec.namespace == self.client.namespace(),
-            "prepared launch belongs to a different server or Kubernetes target"
-        );
-        ensure!(
-            svc.gradient.team_id(&spec.team).await? == spec.team_id,
-            "prepared launch team identity changed"
-        );
+        spec.validate_scope(svc, &self.client).await?;
         let mut pod = self.client.pod(&launch.external_id).await?;
         if let Some(pod) = &pod {
             spec.owned_pod(pod, &launch, &intent.profile)?;
@@ -485,21 +716,16 @@ impl KubernetesLauncher {
             .uid
             .as_deref()
             .context("credential secret has no UID")?;
-        if let Some(owners) = &secret.metadata.owner_references
-            && !owners.is_empty()
-        {
-            let pod = pod
+        ensure!(
+            secret
+                .metadata
+                .owner_references
                 .as_ref()
-                .context("owned secret's pod is missing; refusing worker replacement")?;
-            ensure!(
-                owners.len() == 1
-                    && owners[0].api_version == "v1"
-                    && owners[0].kind == "Pod"
-                    && owners[0].name == pod.metadata.name
-                    && owners[0].uid == pod.metadata.uid,
-                "prepared secret has a different pod owner"
-            );
-        }
+                .is_none_or(Vec::is_empty)
+                || pod.is_some(),
+            "owned secret's pod is missing; refusing worker replacement"
+        );
+        spec.validate_secret_owner(&secret, &launch, pod.as_ref())?;
         svc.state
             .bind_build_objects(
                 &launch,
@@ -517,10 +743,7 @@ impl KubernetesLauncher {
             .find(|worker| worker.worker_id == intent.profile.worker_id.to_string());
         match existing {
             Some(worker) => {
-                ensure!(
-                    launch.registration_started && worker.registration_matches(&display_name, caps),
-                    "worker registration differs from prepared launch"
-                );
+                spec.validate_registration(&launch, &worker)?;
                 ensure!(
                     !worker.connected || pod.is_some(),
                     "connected worker has no owned prepared pod"

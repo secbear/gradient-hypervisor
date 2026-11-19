@@ -57,6 +57,20 @@ impl Launcher {
         }
     }
 
+    pub async fn reconcile_prepared(
+        &self,
+        svc: &ConnectionService,
+        launch_id: Uuid,
+    ) -> anyhow::Result<()> {
+        svc.ensure_mutations_allowed()?;
+        match self {
+            Self::Kubernetes(kubernetes) => kubernetes.reconcile_prepared(svc, launch_id).await,
+            Self::GitHub(_) => {
+                anyhow::bail!("prepared build launches are not supported for GitHub Actions")
+            }
+        }
+    }
+
     pub fn github(&self) -> Option<&GitHubLauncher> {
         match self {
             Launcher::GitHub(github) => Some(github),

@@ -217,6 +217,7 @@ pub fn plan_build_capacity(
             let eligible = launch.is_some_and(|launch| {
                 let age = context.now - launch.dispatched_at;
                 !worker.connected
+                    && launch.cleanup_outcome.is_none()
                     && launch.state != LaunchState::Connected
                     && launch.registration_started
                     && age >= Duration::ZERO

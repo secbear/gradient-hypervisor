@@ -13,7 +13,7 @@ runCommand "gradient-autoscaler-helm" { nativeBuildInputs = [ kubernetes-helm yq
   yq -o=json 'select(.kind == "Role" and .metadata.namespace == "gradient-workers") | .rules' $out | jq -e '
     map(.verbs |= sort) | sort_by(.resources) == [
       {"apiGroups": [""], "resources": ["pods"], "verbs": ["create", "delete", "get", "list"]},
-      {"apiGroups": [""], "resources": ["secrets"], "verbs": ["create", "get", "update"]}
+      {"apiGroups": [""], "resources": ["secrets"], "verbs": ["create", "delete", "get", "update"]}
     ]
   ' >/dev/null
   yq -r 'select(.kind == "ConfigMap") | .data."config.json"' $out | jq -e '
