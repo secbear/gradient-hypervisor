@@ -128,6 +128,7 @@ async fn preview_uses_real_client_and_bounded_planner_without_persisting_proposa
         let preview = preview_build_capacity(&fixture.svc).await.unwrap();
         assert_eq!(preview.total_ready_builds, 5);
         assert_eq!(preview.assessed_builds, 5);
+        assert!(preview.tracked_workers.is_empty());
         assert_eq!(preview.plan.proposed_workers.len(), 2);
         assert_eq!(preview.plan.deferred_builds.len(), 1);
         assert_eq!(
@@ -283,6 +284,14 @@ async fn preview_credits_only_fresh_registered_intents_and_keeps_all_open_launch
     assessment(&server, 3, false).await;
 
     let preview = preview_build_capacity(&fixture.svc).await.unwrap();
+    assert_eq!(preview.tracked_workers.len(), 1);
+    let tracked = &preview.tracked_workers[0];
+    assert_eq!(
+        &tracked.profile,
+        &fresh.build_intent.as_ref().unwrap().profile
+    );
+    assert!(!tracked.connected);
+    assert_eq!(tracked.worker_index, None);
     assert_eq!(
         preview.plan.credited_starting_workers,
         vec![fresh.worker_id.unwrap()]
@@ -318,6 +327,14 @@ async fn preview_credits_only_fresh_registered_intents_and_keeps_all_open_launch
     server.reset().await;
     assessment(&server, 3, true).await;
     let preview = preview_build_capacity(&fixture.svc).await.unwrap();
+    assert_eq!(preview.tracked_workers.len(), 1);
+    let tracked = &preview.tracked_workers[0];
+    assert_eq!(
+        &tracked.profile,
+        &fresh.build_intent.as_ref().unwrap().profile
+    );
+    assert!(tracked.connected);
+    assert_eq!(tracked.worker_index, None);
     assert!(preview.plan.credited_starting_workers.is_empty());
     assert_eq!(preview.plan.deferred_builds.len(), 3);
 
@@ -332,6 +349,8 @@ async fn preview_credits_only_fresh_registered_intents_and_keeps_all_open_launch
         .mount(&server)
         .await;
     let preview = preview_build_capacity(&fixture.svc).await.unwrap();
+    assert_eq!(preview.tracked_workers.len(), 1);
+    assert!(!preview.tracked_workers[0].profile.capabilities.network);
     assert_eq!(
         preview.plan.credited_starting_workers,
         vec![fresh.worker_id.unwrap()]

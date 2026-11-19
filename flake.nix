@@ -44,6 +44,15 @@
       module = pkgs.callPackage ./nix/tests/module.nix {
         nixosModule = self.nixosModules.gradient-autoscaler;
       };
+    } // lib.optionalAttrs (
+      pkgs.stdenv.hostPlatform.isLinux
+      && builtins.hasAttr "gradient-worker-readiness" (gradient.checks.${pkgs.stdenv.hostPlatform.system} or { })
+    ) {
+      worker-readiness-preview = pkgs.callPackage ./nix/tests/readiness-preview {
+        inherit gradient;
+        system = pkgs.stdenv.hostPlatform.system;
+        autoscaler = self.packages.${pkgs.stdenv.hostPlatform.system}.gradient-autoscaler;
+      };
     });
 
     devShells = forAllSystems (pkgs: {

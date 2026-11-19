@@ -156,8 +156,12 @@ struct RotatedSecret {
 
 impl GradientClient {
     pub fn new(base: Url, api_key: String) -> GradientClient {
+        Self::with_http_client(base, api_key, crate::rest::http_client())
+    }
+
+    pub fn with_http_client(base: Url, api_key: String, http: Client) -> GradientClient {
         GradientClient {
-            http: crate::rest::http_client(),
+            http,
             base,
             api_key,
         }

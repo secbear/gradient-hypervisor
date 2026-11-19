@@ -1,6 +1,7 @@
 use crate::build_planner::{BuildPlan, BuildPlanningContext, plan_build_capacity};
 use crate::capacity::{
     BuildCapacityProfile, CapacityAssessmentRequest, CapacityCapabilities, CapacityProfileRequest,
+    TrackedCapacityWorker,
 };
 use crate::config::LauncherConfig;
 use crate::planner::{Limits, backed_off_labels};
@@ -15,6 +16,7 @@ pub struct BuildPreview {
     pub captured_at: String,
     pub total_ready_builds: usize,
     pub assessed_builds: usize,
+    pub tracked_workers: Vec<TrackedCapacityWorker>,
     pub plan: BuildPlan,
 }
 
@@ -119,6 +121,7 @@ pub async fn preview_build_capacity(svc: &ConnectionService) -> anyhow::Result<B
         captured_at: capacity.captured_at,
         total_ready_builds: capacity.total_ready_builds,
         assessed_builds: capacity.builds.len(),
+        tracked_workers: capacity.tracked_workers,
         plan,
     })
 }
