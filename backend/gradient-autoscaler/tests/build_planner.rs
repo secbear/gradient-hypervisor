@@ -32,6 +32,7 @@ fn profile(name: &str, ram: u64, slots: u32) -> CapacityProfileRequest {
         },
         enable_build: true,
         enable_network: false,
+        registration: None,
     }
 }
 
@@ -82,6 +83,8 @@ impl Case {
                 .map(|profile| profile.profile.clone())
                 .collect(),
             tracked_workers: vec![],
+            build_page: None,
+            bootstrap: None,
             builds: (0..jobs)
                 .map(|_| CapacityBuild {
                     architecture: "x86_64-linux".into(),

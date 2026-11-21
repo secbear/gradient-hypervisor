@@ -44,9 +44,10 @@ pub struct Connection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "snake_case")]
 pub enum BuildScalingMode {
     Preview,
+    JointPreview,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -54,6 +55,8 @@ pub enum BuildScalingMode {
 pub struct BuildScalingConfig {
     pub mode: BuildScalingMode,
     pub profiles: Vec<String>,
+    #[serde(default)]
+    pub bootstrap_profiles: Vec<BootstrapProfileConfig>,
     #[serde(default = "default_queue_wait")]
     pub queue_wait: u32,
     #[serde(default = "default_startup_grace")]
@@ -61,6 +64,13 @@ pub struct BuildScalingConfig {
     #[serde(default = "default_max_new_workers")]
     pub max_new_workers: u32,
     pub fallback_ram_mb: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BootstrapProfileConfig {
+    pub pool: String,
+    pub capabilities: WorkerCapabilities,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -100,9 +110,18 @@ impl BuildScalingConfig {
 
 impl Connection {
     pub fn is_preview(&self) -> bool {
+        self.build_scaling.as_ref().is_some_and(|scaling| {
+            matches!(
+                scaling.mode,
+                BuildScalingMode::Preview | BuildScalingMode::JointPreview
+            )
+        })
+    }
+
+    pub fn is_joint_preview(&self) -> bool {
         self.build_scaling
             .as_ref()
-            .is_some_and(|scaling| scaling.mode == BuildScalingMode::Preview)
+            .is_some_and(|scaling| scaling.mode == BuildScalingMode::JointPreview)
     }
 
     pub fn capacity_projects(&self) -> anyhow::Result<Option<Vec<Uuid>>> {
@@ -330,6 +349,21 @@ impl Config {
                 bail!("connection name {:?} is used twice", connection.name);
             }
         }
+        for connection in config
+            .connections
+            .iter()
+            .filter(|conn| conn.is_joint_preview())
+        {
+            if config.connections.iter().any(|other| {
+                other.name != connection.name
+                    && other.gradient_url.origin() == connection.gradient_url.origin()
+            }) {
+                bail!(
+                    "connection {}: joint preview cannot share Gradient URL ownership",
+                    connection.name
+                );
+            }
+        }
 
         Ok(config)
     }
@@ -372,7 +406,7 @@ impl TryFrom<ConnectionFields> for Connection {
                     connection.name
                 );
             };
-            if !connection.worker_capabilities.build
+            if (!scaling.profiles.is_empty() && !connection.worker_capabilities.build)
                 || scaling.startup_grace == 0
                 || scaling.fallback_ram_mb == 0
             {
@@ -381,12 +415,20 @@ impl TryFrom<ConnectionFields> for Connection {
                     connection.name
                 );
             }
+            if scaling.mode != BuildScalingMode::JointPreview
+                && !scaling.bootstrap_profiles.is_empty()
+            {
+                bail!(
+                    "connection {}: bootstrapProfiles requires joint_preview",
+                    connection.name
+                );
+            }
             let alternatives = scaling
                 .profiles
                 .len()
-                .checked_mul(scaling.max_new_workers.max(1) as usize);
-            if scaling.profiles.is_empty() || alternatives.is_none_or(|count| count > MAX_PROFILES)
-            {
+                .checked_add(scaling.bootstrap_profiles.len())
+                .and_then(|count| count.checked_mul(scaling.max_new_workers.max(1) as usize));
+            if alternatives.is_none_or(|count| count == 0 || count > MAX_PROFILES) {
                 bail!(
                     "connection {}: preview accepts at most {MAX_PROFILES} profile alternatives",
                     connection.name
@@ -410,6 +452,29 @@ impl TryFrom<ConnectionFields> for Connection {
                         connection.name
                     );
                 }
+                pool.validate_capacity_environment().map_err(|error| {
+                    anyhow::anyhow!("connection {}: pool {label}: {error:#}", connection.name)
+                })?;
+            }
+            for profile in &scaling.bootstrap_profiles {
+                let label = &profile.pool;
+                let capabilities = profile.capabilities;
+                if capabilities.build || !(capabilities.eval || capabilities.network) {
+                    bail!(
+                        "connection {}: bootstrap profile {label} must be role-only with eval or network",
+                        connection.name
+                    );
+                }
+                if !connection.worker_capabilities.permits(capabilities) {
+                    bail!(
+                        "connection {}: bootstrap profile {label} exceeds connection permissions",
+                        connection.name
+                    );
+                }
+                let pool = kubernetes
+                    .pools
+                    .get(label)
+                    .with_context(|| format!("bootstrap pool {label} is not configured"))?;
                 pool.validate_capacity_environment().map_err(|error| {
                     anyhow::anyhow!("connection {}: pool {label}: {error:#}", connection.name)
                 })?;
@@ -806,6 +871,126 @@ mod tests {
             assert!(error_of(&entry.to_string()).contains("controlled by the assessed profile"));
             entry["buildScaling"] = serde_json::Value::Null;
             assert!(Config::parse(&with_connections(&entry.to_string())).is_ok());
+        }
+    }
+
+    fn joint_connection() -> serde_json::Value {
+        let mut entry = preview_connection();
+        entry["buildScaling"]["mode"] = serde_json::json!("joint_preview");
+        entry["buildScaling"]["bootstrapProfiles"] = serde_json::json!([{
+            "pool": "role",
+            "capabilities": { "build": false, "network": true, "eval": true, "secrets": false, "exec": false }
+        }]);
+        entry["kubernetes"]["pools"]["role"] = serde_json::json!({
+            "system": "aarch64-linux", "features": ["kvm"], "maxJobs": 1
+        });
+        entry
+    }
+
+    #[test]
+    fn joint_preview_is_read_only_and_role_profiles_need_no_build_resources() {
+        let entry = joint_connection();
+        let config = Config::parse(&with_connections(&entry.to_string())).unwrap();
+        let conn = &config.connections[0];
+        assert!(conn.is_preview());
+        assert!(conn.is_joint_preview());
+        let scaling = conn.build_scaling.as_ref().unwrap();
+        assert_eq!(scaling.bootstrap_profiles[0].pool, "role");
+        assert!(!scaling.bootstrap_profiles[0].capabilities.build);
+        let legacy = Config::parse(&with_connections(&preview_connection().to_string())).unwrap();
+        assert!(!legacy.connections[0].is_joint_preview());
+        assert!(
+            legacy.connections[0]
+                .build_scaling
+                .as_ref()
+                .unwrap()
+                .bootstrap_profiles
+                .is_empty()
+        );
+
+        let mut role_only = entry;
+        role_only["buildScaling"]["profiles"] = serde_json::json!([]);
+        role_only["workerCapabilities"] = serde_json::json!({"build": false});
+        assert!(Config::parse(&with_connections(&role_only.to_string())).is_ok());
+    }
+
+    #[test]
+    fn joint_preview_rejects_invalid_roles_permissions_and_combined_bounds() {
+        for (pointer, value, message) in [
+            (
+                "/buildScaling/mode",
+                serde_json::json!("preview"),
+                "requires joint_preview",
+            ),
+            (
+                "/buildScaling/bootstrapProfiles/0/pool",
+                serde_json::json!("missing"),
+                "not configured",
+            ),
+            (
+                "/buildScaling/bootstrapProfiles/0/capabilities/build",
+                serde_json::json!(true),
+                "role-only",
+            ),
+            (
+                "/buildScaling/bootstrapProfiles/0/capabilities",
+                serde_json::json!({
+                    "build": false, "eval": false, "network": false
+                }),
+                "role-only",
+            ),
+            (
+                "/buildScaling/bootstrapProfiles/0/capabilities/exec",
+                serde_json::json!(true),
+                "exceeds connection permissions",
+            ),
+            (
+                "/buildScaling/maxNewWorkers",
+                serde_json::json!(9),
+                "profile alternatives",
+            ),
+            (
+                "/kubernetes/pools/role/system",
+                serde_json::json!(""),
+                "one worker architecture",
+            ),
+            (
+                "/kubernetes/pools/role/features",
+                serde_json::json!(["bad,feature"]),
+                "cannot be encoded",
+            ),
+            (
+                "/kubernetes/pools/x86/buildResources",
+                serde_json::Value::Null,
+                "explicit buildResources",
+            ),
+        ] {
+            let mut entry = joint_connection();
+            let (parent, field) = pointer.rsplit_once('/').unwrap();
+            entry.pointer_mut(parent).unwrap()[field] = value;
+            assert!(error_of(&entry.to_string()).contains(message), "{pointer}");
+        }
+        let mut entry = joint_connection();
+        entry.as_object_mut().unwrap().remove("kubernetes");
+        entry["githubActions"] =
+            serde_json::json!({"tokenFile": "/g", "repository": "acme/runners"});
+        assert!(error_of(&entry.to_string()).contains("requires Kubernetes"));
+    }
+
+    #[test]
+    fn joint_preview_rejects_shared_url_ownership_within_one_config_only() {
+        let first = joint_connection();
+        for mut second in [preview_connection(), joint_connection()] {
+            second["name"] = serde_json::json!("b");
+            let base = second["gradientUrl"].as_str().unwrap().to_owned();
+            for suffix in ["", "/ignored-path", "/#ignored-fragment", "/?ignored-query"] {
+                second["gradientUrl"] = serde_json::json!(format!("{base}{suffix}"));
+                assert!(
+                    error_of(&format!("{first},{second}")).contains("share Gradient URL ownership")
+                );
+            }
+            second["gradientUrl"] = serde_json::json!("https://other.example.com");
+            assert!(Config::parse(&with_connections(&format!("{first},{second}"))).is_ok());
         }
     }
 }

@@ -12,6 +12,7 @@ pub const MAX_TRACKED_PROFILES: usize = 256;
 pub const MAX_PROJECTS: usize = 256;
 pub const MAX_BUILDS: usize = 128;
 pub const MAX_WORKERS: usize = 256;
+pub const MAX_BOOTSTRAP_DEMANDS: usize = 512;
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +25,17 @@ pub struct CapacityAssessmentRequest {
     pub tracked_profiles: Vec<CapacityProfileRequest>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub include_waiting_builds: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_page: Option<BuildPageRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap: Option<BootstrapCapacityRequest>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildPageRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -36,7 +48,59 @@ pub struct CapacityProfileRequest {
     pub profile: BuildCapacityProfile,
     pub enable_network: bool,
     pub enable_build: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration: Option<RegistrationCapabilities>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistrationCapabilities {
+    pub enable_build: bool,
+    pub enable_network: bool,
+    pub enable_eval: bool,
+    pub enable_secrets: bool,
+    pub enable_exec: bool,
+}
+
+impl From<WorkerCapabilities> for RegistrationCapabilities {
+    fn from(capabilities: WorkerCapabilities) -> Self {
+        Self {
+            enable_build: capabilities.build,
+            enable_network: capabilities.network,
+            enable_eval: capabilities.eval,
+            enable_secrets: capabilities.secrets,
+            enable_exec: capabilities.exec,
+        }
+    }
+}
+
+impl RegistrationCapabilities {
+    fn intersect(self, mut capabilities: CapacityCapabilities) -> CapacityCapabilities {
+        capabilities.build &= self.enable_build;
+        capabilities.network &= self.enable_network;
+        capabilities.eval &= self.enable_eval;
+        capabilities.secrets &= self.enable_secrets;
+        capabilities.exec &= self.enable_exec;
+        capabilities
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapCapacityRequest {
+    pub profiles: Vec<BootstrapProfileRequest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tracked_profiles: Vec<BootstrapProfileRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapProfileRequest {
+    pub profile: CapabilityProfile,
+    pub registration: RegistrationCapabilities,
+}
+
+pub type CapabilityProfile = BuildCapacityProfile;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildCapacityProfile {
@@ -80,6 +144,55 @@ pub struct CapacityAssessment {
     pub builds: Vec<CapacityBuild>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tracked_workers: Vec<TrackedCapacityWorker>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_page: Option<BuildPageAssessment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap: Option<BootstrapCapacityAssessment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildPageAssessment {
+    pub remaining_ready_builds: usize,
+    pub next: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapCapacityAssessment {
+    pub observed_at: String,
+    pub complete: bool,
+    pub demands: Vec<BootstrapCapacityDemand>,
+    pub profiles: Vec<BootstrapCapacityProfile>,
+    pub tracked_workers: Vec<BootstrapTrackedWorker>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapCapacityDemand {
+    pub kind: BootstrapDemandKind,
+    pub available: bool,
+    pub profiles: Vec<bool>,
+    pub tracked_workers: Vec<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BootstrapDemandKind {
+    Download,
+    Substitution,
+    Evaluation,
+    InputFetch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapCapacityProfile {
+    pub profile: CapabilityProfile,
+    pub build_profile_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapTrackedWorker {
+    pub profile: CapabilityProfile,
+    pub connected: bool,
+    pub build_tracked_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,7 +311,7 @@ impl CapacityAssessmentRequest {
             for request in requests {
                 request.profile.validate()?;
                 ensure!(
-                    request.enable_build,
+                    request.enable_build && request.effective_capabilities().build,
                     "capacity registration does not enable builds"
                 );
                 ensure!(
@@ -219,6 +332,58 @@ impl CapacityAssessmentRequest {
                 .all(|request| !tracked_ids.contains(&request.profile.worker_id)),
             "capacity worker ID is both prospective and tracked"
         );
+        if let Some(page) = &self.build_page {
+            ensure!(
+                page.after.as_ref().is_none_or(|after| !after.is_empty()),
+                "capacity page cursor is empty"
+            );
+        }
+        if let Some(bootstrap) = &self.bootstrap {
+            ensure!(
+                self.profiles.len() + bootstrap.profiles.len() <= MAX_PROFILES,
+                "too many combined bootstrap profiles"
+            );
+            ensure!(
+                self.tracked_profiles.len() + bootstrap.tracked_profiles.len()
+                    <= MAX_TRACKED_PROFILES,
+                "too many combined bootstrap tracked profiles"
+            );
+            ensure!(
+                self.profiles
+                    .iter()
+                    .all(|profile| profile.registration.is_some()),
+                "bootstrap requires prospective builder registration"
+            );
+            let mut ids = HashSet::new();
+            for request in self.profiles.iter().chain(&self.tracked_profiles) {
+                ensure!(
+                    ids.insert(request.profile.worker_id),
+                    "duplicate bootstrap worker ID"
+                );
+            }
+            for (ordinary, extras) in [
+                (&self.profiles, &bootstrap.profiles),
+                (&self.tracked_profiles, &bootstrap.tracked_profiles),
+            ] {
+                let mut names = ordinary
+                    .iter()
+                    .map(|request| &request.profile.name)
+                    .collect::<HashSet<_>>();
+                for extra in extras {
+                    extra.profile.validate_general(
+                        extra.registration.intersect(extra.profile.capabilities),
+                    )?;
+                    ensure!(
+                        names.insert(&extra.profile.name),
+                        "duplicate bootstrap profile name"
+                    );
+                    ensure!(
+                        ids.insert(extra.profile.worker_id),
+                        "duplicate bootstrap worker ID"
+                    );
+                }
+            }
+        }
         ensure!(
             serde_json::to_vec(self)?.len() <= MAX_REQUEST_BYTES,
             "capacity request exceeds 64 KiB"
@@ -262,8 +427,29 @@ impl BuildCapacityProfile {
         Ok(())
     }
 
-    fn validate_echo(&self, request: &CapacityProfileRequest, tracked: bool) -> anyhow::Result<()> {
-        let intended = &request.profile;
+    fn validate_general(&self, capabilities: CapacityCapabilities) -> anyhow::Result<()> {
+        ensure!(
+            !self.name.trim().is_empty(),
+            "capacity profile name is empty"
+        );
+        ensure!(!self.worker_id.is_nil(), "bootstrap worker ID is nil");
+        ensure!(
+            capabilities.build || capabilities.eval || capabilities.network,
+            "bootstrap profile has no supported role"
+        );
+        if capabilities.build {
+            self.validate()?;
+        }
+        if capabilities.network {
+            ensure!(
+                self.resources.max_concurrent_builds > 0,
+                "bootstrap network profile has no transfer slots"
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_identity_and_resources(&self, intended: &Self) -> anyhow::Result<()> {
         ensure!(
             self.name == intended.name && self.worker_id == intended.worker_id,
             "capacity profile identity does not match request"
@@ -272,9 +458,13 @@ impl BuildCapacityProfile {
             self.resources == intended.resources,
             "capacity profile resources do not match request"
         );
-        let mut effective = intended.capabilities;
-        effective.build &= request.enable_build;
-        effective.network &= request.enable_network;
+        Ok(())
+    }
+
+    fn validate_echo(&self, request: &CapacityProfileRequest, tracked: bool) -> anyhow::Result<()> {
+        let intended = &request.profile;
+        self.validate_identity_and_resources(intended)?;
+        let mut effective = request.effective_capabilities();
         if tracked && !self.capabilities.network {
             effective.network = false;
         }
@@ -283,6 +473,39 @@ impl BuildCapacityProfile {
             "capacity profile capabilities do not match registration intersection"
         );
         Ok(())
+    }
+
+    fn validate_bootstrap_echo(
+        &self,
+        intended: &Self,
+        effective: CapacityCapabilities,
+        tracked: bool,
+    ) -> anyhow::Result<()> {
+        self.validate_identity_and_resources(intended)?;
+        let expected = if tracked {
+            // The server owns tracked registration and may narrow all five permissions.
+            RegistrationCapabilities::from(self.registration_capabilities()).intersect(effective)
+        } else {
+            effective
+        };
+        ensure!(
+            self.capabilities == expected,
+            "bootstrap profile capabilities do not match registration intersection"
+        );
+        Ok(())
+    }
+}
+
+impl CapacityProfileRequest {
+    fn effective_capabilities(&self) -> CapacityCapabilities {
+        let mut effective = self
+            .registration
+            .map_or(self.profile.capabilities, |registration| {
+                registration.intersect(self.profile.capabilities)
+            });
+        effective.build &= self.enable_build;
+        effective.network &= self.enable_network;
+        effective
     }
 }
 
@@ -311,12 +534,38 @@ impl CapacityAssessment {
             "capacity truncation flag does not match backlog"
         );
         parse_timestamp(&self.captured_at)?;
+        match (&request.build_page, &self.build_page) {
+            (Some(input), Some(page)) => {
+                let remaining = self.total_ready_builds - self.builds.len();
+                ensure!(
+                    page.remaining_ready_builds <= remaining
+                        && (input.after.is_some() || page.remaining_ready_builds == remaining),
+                    "capacity page remaining count does not match backlog"
+                );
+                ensure!(
+                    page.next.as_ref().is_none_or(|next| !next.is_empty())
+                        && page.next.is_some() == (page.remaining_ready_builds > 0),
+                    "capacity page cursor does not match remaining builds"
+                );
+            }
+            (Some(_), None) => anyhow::bail!("requested capacity build page is missing"),
+            (None, Some(_)) => anyhow::bail!("unsolicited capacity build page"),
+            (None, None) => {}
+        }
         for (profile, intended) in self.profiles.iter().zip(&request.profiles) {
             profile.validate_echo(intended, false)?;
         }
         let mut correlated_indexes = HashSet::new();
         for (worker, intended) in self.tracked_workers.iter().zip(&request.tracked_profiles) {
-            worker.profile.validate_echo(intended, true)?;
+            if request.bootstrap.is_some() {
+                worker.profile.validate_bootstrap_echo(
+                    &intended.profile,
+                    intended.effective_capabilities(),
+                    true,
+                )?;
+            } else {
+                worker.profile.validate_echo(intended, true)?;
+            }
             if let Some(index) = worker.worker_index {
                 ensure!(
                     worker.connected,
@@ -368,6 +617,10 @@ impl CapacityAssessment {
             }
             for (assessment, profile) in build.profiles.iter().zip(&self.profiles) {
                 if let Some(assessment) = assessment {
+                    ensure!(
+                        profile.capabilities.build,
+                        "build-disabled profile received build capacity"
+                    );
                     assessment.resources.validate_for(&profile.resources)?;
                 }
             }
@@ -377,11 +630,109 @@ impl CapacityAssessment {
                     "connected tracked worker received starting capacity"
                 );
                 if let Some(assessment) = assessment {
+                    ensure!(
+                        worker.profile.capabilities.build,
+                        "build-disabled tracked worker received starting build capacity"
+                    );
                     assessment
                         .resources
                         .validate_for(&worker.profile.resources)?;
                 }
             }
+        }
+        match (&request.bootstrap, &self.bootstrap) {
+            (Some(input), Some(bootstrap)) => bootstrap.validate_against(request, input, self)?,
+            (Some(_), None) => anyhow::bail!("requested bootstrap capacity assessment is missing"),
+            (None, Some(_)) => anyhow::bail!("unsolicited bootstrap capacity assessment"),
+            (None, None) => {}
+        }
+        Ok(())
+    }
+}
+
+impl BootstrapCapacityAssessment {
+    fn validate_against(
+        &self,
+        request: &CapacityAssessmentRequest,
+        bootstrap: &BootstrapCapacityRequest,
+        capacity: &CapacityAssessment,
+    ) -> anyhow::Result<()> {
+        parse_timestamp(&self.observed_at)?;
+        ensure!(
+            self.demands.len() <= MAX_BOOTSTRAP_DEMANDS,
+            "too many bootstrap demands"
+        );
+        ensure!(
+            self.profiles.len() == request.profiles.len() + bootstrap.profiles.len(),
+            "bootstrap profile count does not match request"
+        );
+        ensure!(
+            self.tracked_workers.len()
+                == request.tracked_profiles.len() + bootstrap.tracked_profiles.len(),
+            "bootstrap tracked worker count does not match request"
+        );
+        for (index, profile) in self.profiles.iter().enumerate() {
+            if index < request.profiles.len() {
+                ensure!(
+                    profile.build_profile_index == Some(index),
+                    "bootstrap build profile mapping does not match request order"
+                );
+                ensure!(
+                    profile.profile == capacity.profiles[index],
+                    "bootstrap mapped build profile does not match capacity profile"
+                );
+            } else {
+                let intended = &bootstrap.profiles[index - request.profiles.len()];
+                ensure!(
+                    profile.build_profile_index.is_none(),
+                    "extra bootstrap profile has a build mapping"
+                );
+                profile.profile.validate_bootstrap_echo(
+                    &intended.profile,
+                    intended
+                        .registration
+                        .intersect(intended.profile.capabilities),
+                    false,
+                )?;
+            }
+        }
+        for (index, worker) in self.tracked_workers.iter().enumerate() {
+            if let Some(intended) = request.tracked_profiles.get(index) {
+                ensure!(
+                    worker.build_tracked_index == Some(index),
+                    "bootstrap tracked build mapping does not match request order"
+                );
+                let ordinary = &capacity.tracked_workers[index];
+                ensure!(
+                    worker.connected == ordinary.connected,
+                    "bootstrap tracked connection does not match build capacity"
+                );
+                worker.profile.validate_bootstrap_echo(
+                    &intended.profile,
+                    ordinary.profile.capabilities,
+                    true,
+                )?;
+            } else {
+                let intended = &bootstrap.tracked_profiles[index - request.tracked_profiles.len()];
+                ensure!(
+                    worker.build_tracked_index.is_none(),
+                    "extra bootstrap tracked worker has a build mapping"
+                );
+                worker.profile.validate_bootstrap_echo(
+                    &intended.profile,
+                    intended
+                        .registration
+                        .intersect(intended.profile.capabilities),
+                    true,
+                )?;
+            }
+        }
+        for demand in &self.demands {
+            ensure!(
+                demand.profiles.len() == self.profiles.len()
+                    && demand.tracked_workers.len() == self.tracked_workers.len(),
+                "bootstrap demand matrix dimensions do not match headers"
+            );
         }
         Ok(())
     }

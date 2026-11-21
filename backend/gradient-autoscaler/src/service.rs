@@ -4,7 +4,7 @@ use crate::kinds::{Kind, apply_learned};
 use crate::launcher::Launcher;
 use crate::state::State;
 use std::sync::RwLock;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 use url::Url;
 
 pub struct ConnectionService {
@@ -14,6 +14,8 @@ pub struct ConnectionService {
     pub launcher: Launcher,
     pub state: State,
     pub wake: Notify,
+    /// Pagination has single-instance affinity; restart resets this in-memory cursor.
+    pub(crate) joint_preview_cursor: Mutex<Option<String>>,
     discovered_kinds: RwLock<Vec<Kind>>,
 }
 
@@ -41,6 +43,7 @@ impl ConnectionService {
             launcher,
             state,
             wake: Notify::new(),
+            joint_preview_cursor: Mutex::new(None),
             discovered_kinds,
         }
     }

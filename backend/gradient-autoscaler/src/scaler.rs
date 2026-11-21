@@ -6,6 +6,25 @@ use crate::state::Launch;
 use std::sync::Arc;
 
 pub async fn scale(svc: &Arc<ConnectionService>) -> anyhow::Result<()> {
+    if svc.conn.is_joint_preview() {
+        let preview = crate::joint_preview::preview_joint_capacity(svc).await?;
+        tracing::info!(
+            connection = %svc.conn.name, captured_at = %preview.captured_at,
+            ready = preview.total_ready_builds, assessed = preview.assessed_builds,
+            proposed_build = preview.plan.build.proposed_workers.len(),
+            proposed_capability = preview.plan.capability_workers.len(),
+            deferred_build = preview.plan.build.deferred_builds.len(),
+            deferred_capability = preview.plan.deferred_capabilities.len(),
+            starting = preview.plan.build.credited_starting_workers.len(),
+            draining = preview.plan.build.server_draining,
+            truncated = preview.plan.build.builds_truncated,
+            bootstrap_complete = preview.plan.bootstrap_complete,
+            partial = preview.plan.build.builds_truncated || !preview.plan.bootstrap_complete,
+            "joint capacity preview; no worker changes"
+        );
+        tracing::debug!(connection = %svc.conn.name, plan = ?preview.plan, "joint capacity preview details");
+        return Ok(());
+    }
     if svc.conn.is_preview() {
         let preview = crate::build_preview::preview_build_capacity(svc).await?;
         let pools = preview

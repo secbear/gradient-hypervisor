@@ -195,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
                     profile: profile.clone(),
                     enable_build: profile.capabilities.build,
                     enable_network: profile.capabilities.network,
+                    registration: None,
                 }],
                 ..Default::default()
             },

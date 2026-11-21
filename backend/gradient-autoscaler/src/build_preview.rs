@@ -1,12 +1,12 @@
 use crate::build_planner::{BuildPlan, BuildPlanningContext, plan_build_capacity};
 use crate::capacity::{
     BuildCapacityProfile, CapacityAssessmentRequest, CapacityCapabilities, CapacityProfileRequest,
-    TrackedCapacityWorker,
+    RegistrationCapabilities, TrackedCapacityWorker,
 };
-use crate::config::LauncherConfig;
+use crate::config::{BuildScalingMode, LauncherConfig};
 use crate::planner::{Limits, backed_off_labels};
 use crate::service::ConnectionService;
-use crate::state::LaunchState;
+use crate::state::{Launch, LaunchState};
 use anyhow::{Context, ensure};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -26,12 +26,60 @@ pub async fn preview_build_capacity(svc: &ConnectionService) -> anyhow::Result<B
         .build_scaling
         .as_ref()
         .context("build scaling preview is not configured")?;
-    ensure!(svc.conn.is_preview(), "build scaling mode is not preview");
+    ensure!(
+        config.mode == BuildScalingMode::Preview,
+        "build scaling mode is not preview"
+    );
+    let open = svc.state.open_launches(&svc.conn.name).await?;
+    let (request, labels) = build_preview_request(svc, &open, OffsetDateTime::now_utc(), false)?;
+    let kinds = svc.kinds().await?;
+    let backoff = backed_off_labels(&svc.state, &svc.conn.name, &kinds).await?;
+    let limits = Limits {
+        allowed: config.profiles.clone(),
+        max_launches: svc.conn.max_launches,
+        max_launches_per_kind: svc.conn.max_launches_per_kind,
+    };
+    let capacity = svc
+        .gradient
+        .capacity_assessment(&svc.conn.team, &request)
+        .await?;
+    let policy = config.policy();
+    let plan = plan_build_capacity(
+        &request,
+        &capacity,
+        BuildPlanningContext {
+            connection: &svc.conn.name,
+            open: &open,
+            candidate_labels: &labels,
+            limits: &limits,
+            backoff: &backoff,
+            policy: &policy,
+            now: OffsetDateTime::now_utc(),
+        },
+    )?;
+    Ok(BuildPreview {
+        captured_at: capacity.captured_at,
+        total_ready_builds: capacity.total_ready_builds,
+        assessed_builds: capacity.builds.len(),
+        tracked_workers: capacity.tracked_workers,
+        plan,
+    })
+}
+
+pub(crate) fn build_preview_request(
+    svc: &ConnectionService,
+    open: &[Launch],
+    now: OffsetDateTime,
+    explicit_registration: bool,
+) -> anyhow::Result<(CapacityAssessmentRequest, Vec<String>)> {
+    let config = svc
+        .conn
+        .build_scaling
+        .as_ref()
+        .context("build scaling preview is not configured")?;
     let LauncherConfig::Kubernetes(kubernetes) = &svc.conn.launcher else {
         anyhow::bail!("build scaling preview requires Kubernetes");
     };
-    let open = svc.state.open_launches(&svc.conn.name).await?;
-    let now = OffsetDateTime::now_utc();
     let mut request = CapacityAssessmentRequest {
         projects: svc.conn.capacity_projects()?,
         include_waiting_builds: true,
@@ -66,11 +114,12 @@ pub async fn preview_build_capacity(svc: &ConnectionService) -> anyhow::Result<B
                 },
                 enable_build: caps.build,
                 enable_network: caps.network,
+                registration: explicit_registration.then(|| RegistrationCapabilities::from(caps)),
             });
             labels.push(label.clone());
         }
     }
-    for launch in &open {
+    for launch in open {
         if let Some(intent) = &launch.build_intent
             && launch.cleanup_outcome.is_none()
             && launch.registration_started
@@ -89,40 +138,12 @@ pub async fn preview_build_capacity(svc: &ConnectionService) -> anyhow::Result<B
                 profile: intent.profile.clone(),
                 enable_build: intent.profile.capabilities.build,
                 enable_network: intent.profile.capabilities.network,
+                registration: explicit_registration.then(|| {
+                    RegistrationCapabilities::from(intent.profile.registration_capabilities())
+                }),
             });
         }
     }
     request.validate()?;
-    let kinds = svc.kinds().await?;
-    let backoff = backed_off_labels(&svc.state, &svc.conn.name, &kinds).await?;
-    let limits = Limits {
-        allowed: config.profiles.clone(),
-        max_launches: svc.conn.max_launches,
-        max_launches_per_kind: svc.conn.max_launches_per_kind,
-    };
-    let capacity = svc
-        .gradient
-        .capacity_assessment(&svc.conn.team, &request)
-        .await?;
-    let policy = config.policy();
-    let plan = plan_build_capacity(
-        &request,
-        &capacity,
-        BuildPlanningContext {
-            connection: &svc.conn.name,
-            open: &open,
-            candidate_labels: &labels,
-            limits: &limits,
-            backoff: &backoff,
-            policy: &policy,
-            now: OffsetDateTime::now_utc(),
-        },
-    )?;
-    Ok(BuildPreview {
-        captured_at: capacity.captured_at,
-        total_ready_builds: capacity.total_ready_builds,
-        assessed_builds: capacity.builds.len(),
-        tracked_workers: capacity.tracked_workers,
-        plan,
-    })
+    Ok((request, labels))
 }

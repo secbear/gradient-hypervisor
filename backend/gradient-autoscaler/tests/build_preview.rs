@@ -23,6 +23,7 @@ fn policy() -> BuildScalingConfig {
     BuildScalingConfig {
         mode: BuildScalingMode::Preview,
         profiles: vec!["x86".into()],
+        bootstrap_profiles: vec![],
         queue_wait: 60,
         startup_grace: 120,
         max_new_workers: 2,

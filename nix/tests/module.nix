@@ -70,6 +70,31 @@ let
               };
             };
           };
+          connections.joint = {
+            gradientUrl = "https://joint.gradient.example.com";
+            team = "platform";
+            apiKeyFile = "/run/secrets/gradient-api-key";
+            buildScaling = {
+              mode = "joint_preview";
+              profiles = [ ];
+              fallbackRamMb = 2048;
+              bootstrapProfiles = [{
+                pool = "eval";
+                capabilities = {
+                  build = false;
+                  network = false;
+                  secrets = false;
+                  eval = true;
+                };
+              }];
+            };
+            kubernetes = {
+              tokenFile = "/run/secrets/kubernetes-token";
+              namespace = "gradient-workers";
+              image = "registry.example.com/gradient-worker:2.0.1";
+              pools.eval.system = "x86_64-linux";
+            };
+          };
         };
       }
     ];
@@ -97,5 +122,17 @@ runCommand "gradient-autoscaler-module" { nativeBuildInputs = [ jq ]; } ''
     (.kubernetes.pools.x86 |
       .cpu == "3500m" and .memory == "8Gi" and
       .buildResources == {"cpuCount": 4, "ramTotalMb": 7000, "cpuCoreScore": 4000, "buildCores": null})
+  ' ${configFile} >$out
+  jq -e '
+    .connections[] | select(.name == "joint") |
+    .buildScaling.mode == "joint_preview" and
+    .buildScaling.profiles == [] and
+    .buildScaling.bootstrapProfiles == [{
+      "pool": "eval",
+      "capabilities": {
+        "build": false, "network": false, "secrets": false, "eval": true, "exec": false
+      }
+    }] and
+    (.kubernetes.pools.eval | has("buildResources") == false)
   ' ${configFile} >$out
 ''

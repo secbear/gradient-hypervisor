@@ -7,6 +7,8 @@ pub mod events;
 pub mod github;
 pub mod gradient;
 pub mod http;
+pub mod joint_planner;
+pub mod joint_preview;
 pub mod kinds;
 pub mod kubernetes;
 pub mod launcher;

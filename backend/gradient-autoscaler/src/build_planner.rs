@@ -1,6 +1,6 @@
 use crate::capacity::{
-    CapacityAssessment, CapacityAssessmentRequest, CapacityBuild, MemoryAssumption,
-    ProfileAssessment, RamFit, ResourceAssessment, parse_timestamp,
+    BuildCapacityProfile, CapacityAssessment, CapacityAssessmentRequest, CapacityBuild,
+    MemoryAssumption, ProfileAssessment, RamFit, ResourceAssessment, parse_timestamp,
 };
 use crate::planner::Limits;
 use crate::state::{Launch, LaunchState};
@@ -17,6 +17,7 @@ pub struct BuildScalingPolicy {
     pub fallback_ram_mb: u64,
 }
 
+#[derive(Clone, Copy)]
 pub struct BuildPlanningContext<'a> {
     pub connection: &'a str,
     pub open: &'a [Launch],
@@ -64,6 +65,14 @@ struct Budget {
 }
 
 impl Budget {
+    fn profile(profile: &BuildCapacityProfile) -> Self {
+        Self {
+            slots: profile.resources.max_concurrent_builds,
+            ram_mb: Some(profile.resources.ram_total_mb),
+            waiting: None,
+        }
+    }
+
     fn remaining_after(&self, build: usize, needed: u64) -> Option<u64> {
         if self.slots == 0 {
             return None;
@@ -134,11 +143,125 @@ fn profile_need(assessment: &ProfileAssessment, policy: &BuildScalingPolicy) -> 
     Some(ram_need(&assessment.resources, policy))
 }
 
+pub(crate) fn profile_fits_build(
+    build: &CapacityBuild,
+    profile_index: usize,
+    profile: &BuildCapacityProfile,
+    policy: &BuildScalingPolicy,
+) -> bool {
+    build.profiles[profile_index]
+        .as_ref()
+        .and_then(|assessment| profile_need(assessment, policy))
+        .is_some_and(|needed| {
+            Budget::profile(profile)
+                .remaining_after(0, needed)
+                .is_some()
+        })
+}
+
+pub(crate) fn starting_profile_is_eligible(
+    profile: &BuildCapacityProfile,
+    connected: bool,
+    context: &BuildPlanningContext<'_>,
+) -> bool {
+    !connected
+        && context.open.iter().any(|launch| {
+            launch.worker_id == Some(profile.worker_id)
+                && launch.connection == context.connection
+                && launch.state.is_open()
+                && launch.cleanup_outcome.is_none()
+                && launch.state != LaunchState::Connected
+                && launch.registration_started
+                && context.now >= launch.dispatched_at
+                && launch.build_intent.as_ref().is_some_and(|intent| {
+                    intent.profile == *profile && context.now < intent.startup_deadline
+                })
+        })
+}
+
+// Bootstrap and throughput move this same ledger through both selection phases.
+pub(crate) struct LaunchAccounting {
+    worker_ids: HashSet<Uuid>,
+    per_label: HashMap<String, u32>,
+    total: u32,
+    new_workers: u32,
+}
+
+impl LaunchAccounting {
+    fn new(context: &BuildPlanningContext<'_>) -> anyhow::Result<Self> {
+        let mut launch_ids = HashSet::new();
+        let mut result = Self {
+            worker_ids: HashSet::new(),
+            per_label: HashMap::new(),
+            total: u32::try_from(context.open.len()).unwrap_or(u32::MAX),
+            new_workers: 0,
+        };
+        for launch in context.open {
+            ensure!(
+                launch.connection == context.connection && launch.state.is_open(),
+                "build planner received a launch outside its open connection scope"
+            );
+            ensure!(launch_ids.insert(launch.id), "duplicate open launch ID");
+            if let Some(worker) = launch.worker_id {
+                ensure!(result.worker_ids.insert(worker), "duplicate open worker ID");
+            }
+            let count = result.per_label.entry(launch.label.clone()).or_default();
+            *count = count.saturating_add(1);
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn can_launch(
+        &self,
+        label: &str,
+        worker_id: Uuid,
+        context: &BuildPlanningContext<'_>,
+    ) -> bool {
+        !context.backoff.contains(label)
+            && context
+                .limits
+                .allowed
+                .iter()
+                .any(|allowed| allowed == label)
+            && !self.worker_ids.contains(&worker_id)
+            && self.total < context.limits.max_launches
+            && self.per_label.get(label).copied().unwrap_or(0)
+                < context.limits.max_launches_per_kind
+            && self.new_workers < context.policy.max_new_workers
+    }
+
+    pub(crate) fn reserve(
+        &mut self,
+        label: &str,
+        worker_id: Uuid,
+        context: &BuildPlanningContext<'_>,
+    ) -> bool {
+        if !self.can_launch(label, worker_id, context) {
+            return false;
+        }
+        self.worker_ids.insert(worker_id);
+        let count = self.per_label.entry(label.to_owned()).or_default();
+        *count = count.saturating_add(1);
+        self.total = self.total.saturating_add(1);
+        self.new_workers = self.new_workers.saturating_add(1);
+        true
+    }
+}
+
 pub fn plan_build_capacity(
     request: &CapacityAssessmentRequest,
     capacity: &CapacityAssessment,
     context: BuildPlanningContext<'_>,
 ) -> anyhow::Result<BuildPlan> {
+    let accounting = validate_build_planning(request, capacity, &context)?;
+    plan_build_capacity_seeded(request, capacity, context, accounting, Vec::new())
+}
+
+pub(crate) fn validate_build_planning(
+    request: &CapacityAssessmentRequest,
+    capacity: &CapacityAssessment,
+    context: &BuildPlanningContext<'_>,
+) -> anyhow::Result<LaunchAccounting> {
     capacity.validate_against(request)?;
     ensure!(
         request.include_waiting_builds,
@@ -161,22 +284,16 @@ pub fn plan_build_capacity(
         "candidate kind labels do not match profiles",
     );
 
-    let mut launch_ids = HashSet::new();
-    let mut worker_ids = HashSet::new();
-    let mut per_label = HashMap::<&str, u32>::new();
-    for launch in context.open {
-        ensure!(
-            launch.connection == context.connection && launch.state.is_open(),
-            "build planner received a launch outside its open connection scope"
-        );
-        ensure!(launch_ids.insert(launch.id), "duplicate open launch ID");
-        if let Some(worker) = launch.worker_id {
-            ensure!(worker_ids.insert(worker), "duplicate open worker ID");
-        }
-        let count = per_label.entry(&launch.label).or_default();
-        *count = count.saturating_add(1);
-    }
+    LaunchAccounting::new(context)
+}
 
+pub(crate) fn plan_build_capacity_seeded(
+    request: &CapacityAssessmentRequest,
+    capacity: &CapacityAssessment,
+    context: BuildPlanningContext<'_>,
+    mut accounting: LaunchAccounting,
+    seeds: Vec<PlannedBuildWorker>,
+) -> anyhow::Result<BuildPlan> {
     let mut result = BuildPlan {
         builds_truncated: capacity.builds_truncated,
         server_draining: capacity.server_draining,
@@ -210,22 +327,11 @@ pub fn plan_build_capacity(
         .iter()
         .enumerate()
         .map(|(tracked, worker)| {
-            let launch = context
-                .open
-                .iter()
-                .find(|launch| launch.worker_id == Some(worker.profile.worker_id));
-            let eligible = launch.is_some_and(|launch| {
-                let age = context.now - launch.dispatched_at;
-                !worker.connected
-                    && launch.cleanup_outcome.is_none()
-                    && launch.state != LaunchState::Connected
-                    && launch.registration_started
-                    && age >= Duration::ZERO
-                    && launch.build_intent.as_ref().is_some_and(|intent| {
-                        intent.profile == request.tracked_profiles[tracked].profile
-                            && context.now < intent.startup_deadline
-                    })
-            });
+            let eligible = starting_profile_is_eligible(
+                &request.tracked_profiles[tracked].profile,
+                worker.connected,
+                &context,
+            );
             Budget {
                 slots: if eligible {
                     worker.profile.resources.max_concurrent_builds
@@ -237,9 +343,17 @@ pub fn plan_build_capacity(
             }
         })
         .collect::<Vec<_>>();
-    let mut selected = Vec::<(usize, Budget)>::new();
+    let mut selected = seeds
+        .iter()
+        .map(|seed| {
+            (
+                seed.profile_index,
+                Budget::profile(&capacity.profiles[seed.profile_index]),
+            )
+        })
+        .collect::<Vec<_>>();
+    result.proposed_workers = seeds;
     let mut used_starting = HashSet::new();
-    let mut total = u32::try_from(context.open.len()).unwrap_or(u32::MAX);
 
     for (position, &(ready_at, index)) in order.iter().enumerate() {
         let build = &capacity.builds[index];
@@ -326,29 +440,14 @@ pub fn plan_build_capacity(
             else {
                 continue;
             };
-            let mut budget = Budget {
-                slots: candidate.resources.max_concurrent_builds,
-                ram_mb: Some(candidate.resources.ram_total_mb),
-                waiting: None,
-            };
+            let mut budget = Budget::profile(candidate);
             if !budget.take(index, needed) {
                 continue;
             }
             fitting = true;
-            if worker_ids.contains(&candidate.worker_id) {
+            if !accounting.reserve(label, candidate.worker_id, &context) {
                 continue;
             }
-            let count = per_label.get(label.as_str()).copied().unwrap_or(0);
-            if total >= context.limits.max_launches
-                || count >= context.limits.max_launches_per_kind
-                || u32::try_from(result.proposed_workers.len()).unwrap_or(u32::MAX)
-                    >= context.policy.max_new_workers
-            {
-                continue;
-            }
-            total = total.saturating_add(1);
-            per_label.insert(label, count.saturating_add(1));
-            worker_ids.insert(candidate.worker_id);
             selected.push((profile, budget));
             result.proposed_workers.push(PlannedBuildWorker {
                 profile_index: profile,

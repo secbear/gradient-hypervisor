@@ -227,6 +227,14 @@ let
     };
   };
 
+  workerCapabilitiesOptions = {
+    options = lib.genAttrs [ "build" "network" "secrets" "eval" ] (role: mkEnableOption "the ${role} worker capability" // {
+      default = true;
+    }) // {
+      exec = mkEnableOption "the exec worker capability";
+    };
+  };
+
   connectionOptions = { name, ... }: {
     options = {
       gradientUrl = mkOption {
@@ -297,13 +305,7 @@ let
 
       workerCapabilities = mkOption {
         default = { };
-        type = types.submodule {
-          options = lib.genAttrs [ "build" "network" "secrets" "eval" ] (role: mkEnableOption "the ${role} worker capability" // {
-            default = true;
-          }) // {
-            exec = mkEnableOption "the exec worker capability";
-          };
-        };
+        type = types.submodule workerCapabilitiesOptions;
         description = "Capabilities granted to workers.";
       };
 
@@ -338,12 +340,29 @@ let
         type = types.nullOr (types.submodule {
           options = {
             mode = mkOption {
-              type = types.enum [ "preview" ];
-              description = "Reports build capacity plans without worker, webhook or Kubernetes changes.";
+              type = types.enum [ "preview" "joint_preview" ];
+              description = "Selects build-only or joint capacity preview without worker, webhook or Kubernetes changes.";
             };
             profiles = mkOption {
               type = types.listOf types.str;
               description = "Kubernetes pool names in preference order; each needs buildResources.";
+            };
+            bootstrapProfiles = mkOption {
+              type = types.listOf (types.submodule {
+                options = {
+                  pool = mkOption {
+                    type = types.str;
+                    description = "Kubernetes pool for a role-only bootstrap profile.";
+                  };
+                  capabilities = mkOption {
+                    type = types.submodule workerCapabilitiesOptions;
+                    default = { };
+                    description = "Role-only capabilities; disable build and stay within workerCapabilities.";
+                  };
+                };
+              });
+              default = [ ];
+              description = "Additional eval or network profiles for joint_preview, without build sizing.";
             };
             queueWait = mkOption {
               type = types.ints.unsigned;
@@ -358,7 +377,7 @@ let
             maxNewWorkers = mkOption {
               type = types.ints.unsigned;
               default = 2;
-              description = "Maximum proposed workers per assessment; profiles times max(1, maxNewWorkers) must not exceed 16.";
+              description = "Maximum proposed workers per assessment; combined profiles times max(1, maxNewWorkers) must not exceed 16.";
             };
             fallbackRamMb = mkOption {
               type = types.ints.positive;
@@ -367,7 +386,7 @@ let
           };
         });
         default = null;
-        description = "Opt-in ordinary-build capacity preview; null retains legacy capability scaling.";
+        description = "Opt-in capacity preview; null retains legacy capability scaling.";
       };
     };
   };
@@ -398,7 +417,9 @@ let
         workerSubstituters workerTrustedPublicKeys workerCapabilities idleTimeout maxLifetime;
       apiKeyFile = "${credentialsDir}/${name}-api-key";
     } // lib.optionalAttrs (connection.buildScaling != null) {
-      inherit (connection) buildScaling;
+      buildScaling = if connection.buildScaling.bootstrapProfiles == [ ] then
+        lib.removeAttrs connection.buildScaling [ "bootstrapProfiles" ]
+      else connection.buildScaling;
     } // launcherConfig name connection) cfg.connections;
   };
 

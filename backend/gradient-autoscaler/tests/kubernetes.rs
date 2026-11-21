@@ -1434,6 +1434,7 @@ async fn preview_catch_up_does_not_resume_prepared_cleanup() {
     svc.conn.build_scaling = Some(BuildScalingConfig {
         mode: BuildScalingMode::Preview,
         profiles: vec!["x86".into()],
+        bootstrap_profiles: vec![],
         queue_wait: 30,
         startup_grace: 120,
         max_new_workers: 2,
